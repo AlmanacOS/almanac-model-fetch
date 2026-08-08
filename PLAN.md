@@ -27,8 +27,9 @@ What *does* exist is better, and the design is built on it:
 
 The critical structural fact: **the HF commit signature covers the tree, the tree
 contains the LFS pointer blob, and the pointer contains the `oid sha256:` we
-stream-verify the download against.** That is an unbroken cryptographic chain from
-HF's signing key to the model bytes. Confirmed by hand:
+stream-verify the download against.** That is a cryptographic chain from HF's
+signing key to the model bytes — with one caveat: the internal commit→tree→blob
+links are git SHA-1, which is collision-broken (see §11). Confirmed by hand:
 
 ```
 commit a6adef13 (gpgsig present)  →  tree 116f6efc
@@ -58,18 +59,38 @@ commit-signed tree. Bundle carries the raw git objects so this is re-derivable
 offline. Defeats: CDN tampering, corrupted transfer, truncated download, and
 substitution of any file that HF's own index does not name.
 
-**Tier 2 — Upstream signature (captured always, verified when possible).**
-Capture the `gpgsig` commit object byte-for-byte. On first encounter, present HF's
-key fingerprint to the operator and TOFU-pin it to a local trust store; verify
-against it thereafter. Manifest status is one of `verified`,
-`signature_present_key_unpinned`, `signature_present_key_mismatch` (loud failure),
-or `unsigned` (ModelScope's normal state). Never `verified` without a real check.
+**Tier 2 — Upstream signature (captured always, verified only with key material).**
+Capture the `gpgsig` commit object byte-for-byte. Two operations here are distinct
+and must never be conflated:
+
+- *Continuity observation* — possible today, without HF's key. Record the issuer
+  fingerprint the signature names on first contact; flag loudly if a later fetch
+  shows a different one. This detects a key *change* mid-history; it proves
+  nothing about identity, because a fingerprint is a claim inside
+  attacker-suppliable data, not key material. Comparing fingerprints is string
+  comparison, not cryptography, and the manifest status for this state is
+  `signature_present_key_unpinned` — never anything stronger.
+- *Verification* — possible only once HF's actual public key is obtained out of
+  band (§11). Only then is the signature mathematically checked, only then is
+  `verified` ever emitted, and what gets pinned is the **key**, not its
+  fingerprint.
+
+Manifest status is one of `verified`, `signature_present_key_unpinned`,
+`signature_present_key_mismatch` (loud failure), or `unsigned` (ModelScope's
+normal state). Never `verified` without a real check. The trust store
+accordingly pins keys; observed-fingerprint history is kept as a separate,
+explicitly weaker record.
 
 **Tier 3 — Bundle signature (the one that closes the airgap).**
-The fetcher signs `manifest.json` with ed25519 in minisign format. The manifest
-commits to every file hash and all captured upstream evidence, so one signature
-covers the whole bundle transitively. The airgapped box holds only the public key,
-pre-provisioned out of band. No PKI, no network, no transparency log.
+The fetcher signs `manifest.json` with ed25519 in minisign format; the signed
+trusted-comment also names the bundle digest, so a signature cannot be lifted
+onto a different bundle. The manifest commits to every model file's hash, so the
+signature covers the model transitively. (It does not yet commit to the
+`evidence/` files — adding evidence digests to the manifest lands with full
+capture in §10 step 6, and until then evidence files authenticate themselves by
+their git OIDs rather than through the signature.) The airgapped box holds only
+the public key, pre-provisioned out of band. No PKI, no network, no
+transparency log.
 
 Tier 3 is what an importer should actually gate on. Tiers 1 and 2 are the evidence
 that the fetcher was not itself deceived, preserved so it can be audited later.
@@ -81,29 +102,34 @@ that the fetcher was not itself deceived, preserved so it can be audited later.
 ```
 almanac-model-fetch/
 ├── Cargo.toml                    workspace root
-├── crates/
-│   ├── amf-cli/                  arg parsing, TUI prompts, progress, main()
-│   ├── amf-source/               Source trait + HF and ModelScope backends
-│   ├── amf-verify/               streaming hash, git object parsing, GPG, minisign
-│   ├── amf-bundle/               bundle layout, manifest, dedup, atomic writes
-│   └── amf-fs/                   filesystem detection (exFAT/FAT32), free space
-└── xtask/                        cross-compilation driver (cargo-zigbuild)
+└── crates/
+    ├── amf-cli/                  arg parsing, prompts, progress, main()  [bin: amf]
+    ├── amf-source/               Source trait + backends, verified download
+    ├── amf-verify/               streaming hash, git objects, LFS, minisign
+    ├── amf-bundle/               bundle layout, manifest, dedup, atomic writes
+    └── amf-fs/                   filesystem detection (exFAT/FAT32), free space
 ```
+
+(An `xtask/` cross-compilation driver is planned alongside §9, not yet present.)
 
 Splitting `amf-verify` and `amf-bundle` out of the CLI matters because the
 airgapped-side importer (a later tool) needs exactly those two crates and must not
 drag in HTTP or TUI dependencies.
 
-### Key dependencies
+### Key dependencies (as built)
 
-`clap` (derive) · `tokio` + `reqwest` (streaming, range requests) · `sha2` ·
-`serde`/`serde_json` (`preserve_order`) · `indicatif` · `dialoguer` ·
-`sequoia-openpgp` (pure-Rust OpenPGP — no gpg binary shell-out) ·
-`minisign` · `sysinfo` + platform syscalls for §7 · `thiserror`.
+`clap` (derive) · `tokio` + `reqwest` (rustls, streaming, range requests) ·
+`sha2`/`sha1`/`hex` · `serde`/`serde_json` (manifest byte-stability comes from
+fixed struct field order, so no `preserve_order` feature is needed) ·
+`indicatif` · `dialoguer` · `minisign` · `libc`/`windows-sys` for §7 ·
+`thiserror`/`anyhow`.
 
-`sequoia-openpgp` over shelling out to `gpg`: static binary, no external
-dependency on the target, and parsing signatures in-process avoids the classic
-"trusted the exit code of a program that wasn't there" failure.
+An OpenPGP library lands with the Tier-2 verification work (§2). The choice
+there is a pure-Rust implementation (`sequoia-openpgp`, falling back to `rpgp`
+if it fights the musl/Windows targets) rather than shelling out to `gpg`:
+static binary, no external dependency on the target, and parsing signatures
+in-process avoids the classic "trusted the exit code of a program that wasn't
+there" failure.
 
 ---
 
@@ -112,12 +138,22 @@ dependency on the target, and parsing signatures in-process avoids the classic
 ```rust
 #[async_trait]
 pub trait Source {
-    async fn resolve(&self, repo: &RepoId, rev: Option<&str>) -> Result<Revision>;
-    async fn list_variants(&self, rev: &Revision) -> Result<Vec<Variant>>;
-    async fn evidence(&self, rev: &Revision) -> Result<Evidence>;
-    async fn open_stream(&self, f: &RemoteFile, offset: u64) -> Result<ByteStream>;
+    fn kind(&self) -> SourceKind;
+    /// Resolve a spec's revision to an immutable commit SHA.
+    async fn resolve(&self, spec: &RepoSpec) -> Result<Revision, SourceError>;
+    /// List every file at a resolved revision.
+    async fn list_files(&self, rev: &Revision) -> Result<Vec<RemoteFile>, SourceError>;
+    /// Provided: group files into selectable variants.
+    async fn list_variants(&self, rev: &Revision) -> Result<Vec<Variant>, SourceError> { … }
 }
 ```
+
+Downloading is deliberately *not* a trait method: both hosts serve bytes over
+plain HTTPS URLs, so a single free function
+(`amf_source::download::download_verified`) handles streaming, hashing, and
+Range-based resume for every backend. Evidence capture likewise lives in the
+fetch pipeline, not the trait — it is about what surrounds the files, not how a
+host lists them.
 
 `Variant` is **a set of files, not one file** — sharded quants
 (`DeepSeek-R1-UD-IQ1_S/…-00001-of-00003.gguf`) are the norm for large models and are
@@ -129,8 +165,14 @@ selectable variant with a summed size.
 selected file, and the LFS pointer blobs — the material for offline re-derivation.
 
 - **HuggingFace — the default source.** `/api/models/{id}/tree/{rev}?recursive=true`
-  for listing; git smart-HTTP (`--depth 1 --filter=blob:none`, LFS smudge disabled)
-  for the signed commit and tree objects; `/resolve/{rev}/{path}` for bytes.
+  for listing (paginated via the `Link` header); `/resolve/{rev}/{path}` for the
+  model bytes. Evidence comes from two channels, because a `blob:none` partial
+  clone by definition fetches no blobs and therefore cannot yield the LFS
+  pointers the chain needs: the **pointer blobs** are fetched over plain HTTPS
+  from `/raw/{commit}/{path}` (which serves the pointer text, not the model),
+  and the **signed commit and tree objects** come from git smart-HTTP
+  (commit and trees only). Every captured object is verified against its OID
+  before it is trusted or stored.
 - **ModelScope — secondary, explicitly selected.**
   `/api/v1/models/{id}/repo/files?Revision=&Recursive=True` supplies `Sha256` for
   every file directly. Same git-object capture, which records `unsigned` at Tier 2.
@@ -185,10 +227,13 @@ re-fetching the same variant at the same revision lands on the same directory na
 and dedup is a directory-existence check plus a manifest hash comparison — no
 re-download, no re-hash of tens of gigabytes.
 
-`manifest.json` records: tool name/version/build, source host, repo ID, resolved
-commit SHA, variant label, per-file `{path, sha256, size}`, bundle digest, UTC fetch
-timestamp, the three-tier verification statuses, corroboration results, and the
-C2PA-absence record.
+`manifest.json` records: tool name and version, source host, repo ID, resolved
+commit SHA, requested revision, variant label, per-file `{path, sha256, size}`,
+bundle digest, UTC fetch timestamp, the Tier-1 and Tier-2 verification statuses,
+corroboration results, and the C2PA record. Tier 3 is deliberately *not* a field
+in the manifest: the signature's presence is a fact about the bundle, not a
+claim inside it — a manifest cannot vouch for its own signature, so the
+`.minisig` file alongside it is the only place that tier lives.
 
 ---
 
@@ -198,7 +243,9 @@ C2PA-absence record.
 2. Fetch tree listing; group into variants; if no `:variant` given, present an
    interactive picker (size, quant, shard count) — `--variant`/`--yes` for scripting.
 3. Capture evidence: signed commit object, tree path, LFS pointers, API responses.
-4. Tier 2 check: parse `gpgsig`, TOFU-pin or verify the fingerprint, record status.
+4. Tier 2 check per the §2 split: parse `gpgsig`, record the issuer fingerprint
+   against the continuity history, and *verify* only if a pinned public key is
+   held; record the honest status either way.
 5. **Corroboration (best-effort, never blocking)**: query the counterpart host for
    the same repo/file under a short timeout (~5 s, no retries). Three outcomes:
    *match* → recorded as corroboration; *unreachable or absent* → recorded as
@@ -208,11 +255,14 @@ C2PA-absence record.
    the same artifact is a serious signal and must not scroll past in a progress bar.
    Corroboration never gates the fetch and never extends it by more than the timeout.
 6. Preflight the destination: filesystem type (§7), free space against summed size.
-7. Download to `<bundle>/.partial/`, hashing the stream as it lands. Abort the moment
-   the running hash cannot match. Resume via HTTP Range against the partial file,
-   re-hashing the existing prefix on resume so a resumed download is verified exactly
-   as strictly as a fresh one.
-8. On success, atomically rename `.partial/` into place.
+7. Download into a *sibling* staging directory, `<bundle>.partial/`, hashing the
+   stream as it lands. (Sibling, not inside the bundle: the bundle directory
+   must never exist until it is complete, and a `.partial` subdirectory would
+   require creating it first.) Abort the moment the running hash cannot match.
+   Resume via HTTP Range against the partial file, re-hashing the existing
+   prefix on resume so a resumed download is verified exactly as strictly as a
+   fresh one; a partial file *longer* than the target is discarded, not trusted.
+8. On success, atomically rename `<bundle>.partial/` to `<bundle>/`.
 9. Write `manifest.json`, sign it, write `manifest.json.minisig`.
 10. `fsync` files and directory, then report the bundle path and digest.
 
@@ -228,9 +278,18 @@ sequentially with a per-model summary and a non-zero exit if any failed.
 GGUF files routinely exceed FAT32's 4 GiB single-file ceiling, and the failure mode
 is a truncated write partway through a 40 GB download.
 
-- **Linux**: `statfs` `f_type` magic (`0x5346544e` NTFS, exFAT, `0x4d44` MSDOS/FAT).
+- **Linux** needs three layers, because no single one suffices: `statfs`
+  `f_type` magic for in-kernel filesystems (all of FAT12/16/32 share the one
+  `MSDOS` magic `0x4d44`, so the magic alone cannot name the variant);
+  `/proc/self/mountinfo` driver names, without which a FUSE-mounted exFAT or
+  NTFS drive reports only the FUSE magic and would be misclassified; and a
+  best-effort read of the FAT boot sector's BPB (cluster-count computation per
+  the Microsoft spec) to tell FAT32 from FAT16 in the refusal message. The BPB
+  read is decoration on an error path — it degrades to "FAT (vfat)" without
+  root, never fails a run.
 - **macOS**: `statfs` `f_fstypename` string (`"exfat"`, `"msdos"`).
-- **Windows**: `GetVolumeInformationW` filesystem name buffer.
+- **Windows**: `GetVolumeInformationW`, which names the variant directly
+  (`FAT32`, `exFAT`, `NTFS`).
 
 **FAT32 is refused outright** — regardless of whether the current selection happens
 to fit under 4 GiB, and `--force` does not override it. The error names the exact
@@ -259,13 +318,21 @@ after a 40 GB transfer is the outcome the check exists to prevent.
 ```
 amf fetch <repo-spec>... --usb <path> [--variant Q4_K_M]
                                      [--source hf|modelscope]   # default: hf
-                                     [--revision <sha>] [--yes] [--force]
+                                     [--key <secret-key>]       # signs the bundle
+                                     [--yes] [--force]
                                      [--require-signature] [--no-corroborate]
-amf verify <bundle-path>            re-verify a bundle in place (works airgapped)
-amf list <usb-path>                 inventory bundles on a drive
-amf keygen                          generate the fetcher's ed25519 signing key
-amf trust list|add|remove           manage the TOFU key store
+amf verify <path> [--public-key <pub>]  re-verify bundle(s) in place (airgapped)
+amf list <usb-path>                     inventory bundles on a drive
+amf keygen [--secret …] [--public …]    generate the fetcher's signing keypair
+           [--password …]
 ```
+
+A revision is pinned in the spec itself (`org/name@<rev>`); there is no separate
+`--revision` flag. Without `--key` the bundle is written unsigned, with a loud
+warning that the airgapped side can then check contents but not origin.
+
+Planned, landing with the Tier-2 rework (§2): `amf trust`, managing the pinned
+**keys** and, separately, the observed-fingerprint history.
 
 `amf verify` deliberately requires no network and no HF key: it re-derives the
 Tier-1 chain and checks the Tier-3 signature. It is the command the airgapped
@@ -287,30 +354,38 @@ implements.
 
 ## 10. Build order
 
-1. Workspace skeleton, error types, `amf-fs` filesystem detection (self-contained,
-   testable immediately).
-2. `amf-source`: HF backend — resolve, tree listing, variant grouping incl. shards.
-3. `amf-verify`: streaming SHA256, LFS pointer parsing, git object parsing.
-4. `amf-bundle`: manifest schema, content-addressed naming, atomic write, dedup.
-5. Download pipeline: streaming verify, resume, progress.
-6. Tier 2: OpenPGP signature capture, TOFU trust store.
-7. Tier 3: minisign keygen, sign, verify; `amf verify` subcommand.
-8. ModelScope backend against the same trait; corroboration.
-9. C2PA detection (sidecar / GGUF KV / JUMBF box) with honest absence recording.
-10. Cross-compilation via xtask; `SHA256SUMS`.
+1. ✅ Workspace skeleton, error types, `amf-fs` filesystem detection.
+2. ✅ `amf-source`: HF backend — resolve, tree listing, variant grouping incl. shards.
+3. ✅ `amf-verify`: streaming SHA256, LFS pointer parsing, git object parsing
+   (the offline chain re-derivation is written and tested against a real signed
+   HF commit; the fetch-side capture of commit/tree objects is not).
+4. ✅ `amf-bundle`: manifest schema, content-addressed naming, atomic write, dedup.
+5. ✅ Download pipeline: streaming verify, Range resume, progress.
+6. ⬜ Tier 2: git smart-HTTP capture of commit/tree objects, OpenPGP signature
+   parsing, key-pinning trust store (per the §2 continuity-vs-verification split).
+7. ✅ Tier 3: minisign keygen, sign, verify; `amf verify` subcommand.
+8. ⬜ ModelScope backend against the same trait; corroboration.
+9. ⬜ C2PA detection (sidecar / GGUF KV / JUMBF box); sidecar-absence recording
+   exists, the other two probes do not.
+10. ⬜ Cross-compilation via xtask; `SHA256SUMS`.
 
-Testing: unit tests on hash/pointer/manifest logic; a `wiremock` HTTP fixture for
-source backends including truncation, hash-mismatch, and mid-stream disconnect;
-end-to-end against a real small model (`unsloth/Llama-3.2-1B-Instruct-GGUF:Q2_K`,
-554 MB) writing to a loopback exFAT image, plus a FAT32 loopback to exercise the
-refusal path.
+Testing, as built: hermetic unit and integration tests against *real captured
+data* — genuine `mkfs.fat` boot sectors, real HF tree listings, and a real
+GPG-signed HF commit whose chain to a 5 GB model's SHA256 is re-derived offline
+— plus `#[ignore]`d live tests against huggingface.co covering resolve,
+download, Range resume, and hash-mismatch rejection
+(`cargo test --workspace -- --ignored`). Still planned: a mock-HTTP fixture for
+mid-stream disconnects, and loopback exFAT/FAT32 images to exercise the mount
+detection and refusal paths end-to-end (needs root, so likely CI-only).
 
 ---
 
 ## 11. Open risks
 
-- **HF's signing key is unpublished.** Tier 2 is TOFU on first contact. Getting the
-  fingerprint confirmed by HF out of band would upgrade this materially, and is worth
+- **HF's signing key is unpublished.** Without the key material itself, Tier 2
+  can only ever observe fingerprint continuity, never verify (§2). Obtaining the
+  actual public key from HF out of band — or persuading them to publish it — is
+  the single change that would upgrade Tier 2 to real verification, and is worth
   an email to them.
 - **HF may rotate the system key.** Rotation is indistinguishable from an attack
   under TOFU; the tool will refuse and require explicit operator re-pinning. Correct,
@@ -324,5 +399,17 @@ refusal path.
   `--require-signature` will refuse ModelScope fetches by design.
 - **C2PA may land later** in a form not yet specified. The detection layer is written
   to be extended, and absence is recorded structurally rather than as a bare null.
+- **The chain's internal links are SHA-1.** Git object ids — commit→tree→blob —
+  are SHA-1, which is broken against chosen-prefix collision attacks. An
+  attacker who could plant two colliding pointer blobs could make the signed
+  tree vouch for either. Mitigations, in order: the final content check is
+  always the pointer's SHA-256, so the model bytes themselves are never
+  SHA-1-protected; the fetcher cross-checks the pointer hash against the REST
+  API's independently served `lfs.oid`, so both channels would have to agree on
+  the substituted blob; and a future hardening is swapping `amf-verify`'s plain
+  `sha1` for a collision-detecting implementation (`sha1collisiondetection`),
+  which rejects blocks bearing the known attack signatures. Until then, Tier 1's
+  substitution guarantee is as strong as SHA-1's collision resistance at the
+  tree/pointer links, and readers of the trust model should know that.
 - **Sequoia's build** pulls a nontrivial dependency tree; if it fights the musl or
   Windows targets, the fallback is `pgp` (rpgp), which is lighter but less complete.

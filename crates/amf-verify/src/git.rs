@@ -34,6 +34,13 @@ impl ObjectKind {
 /// Git hashes `"<type> <length>\0<content>"`, so the identity of an object is
 /// bound to its type and length as well as its bytes. That framing is what stops
 /// a tree from being reinterpreted as a blob of the same bytes.
+///
+/// Git object ids are SHA-1, which is broken against chosen-prefix collision
+/// attacks — so these links are the weakest part of the evidence chain, and the
+/// model bytes themselves are deliberately never protected by them: the final
+/// content check is always the LFS pointer's SHA-256, cross-checked against the
+/// REST API's independently served hash. A future hardening is a
+/// collision-detecting SHA-1 (`sha1collisiondetection`) here.
 pub fn object_id(kind: ObjectKind, content: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(kind.as_str().as_bytes());
