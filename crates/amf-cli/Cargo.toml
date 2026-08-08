@@ -1,0 +1,26 @@
+[package]
+name = "amf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "almanac-model-fetch command-line interface"
+
+[[bin]]
+name = "amf"
+path = "src/main.rs"
+
+[dependencies]
+amf-bundle = { path = "../amf-bundle" }
+amf-fs = { path = "../amf-fs" }
+amf-source = { path = "../amf-source" }
+amf-verify = { path = "../amf-verify" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+indicatif = "0.17"
+dialoguer = { version = "0.11", default-features = false }
+anyhow = "1"
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

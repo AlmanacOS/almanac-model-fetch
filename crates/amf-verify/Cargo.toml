@@ -1,0 +1,18 @@
+[package]
+name = "amf-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Streaming hash verification and git evidence-chain re-derivation"
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+minisign = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

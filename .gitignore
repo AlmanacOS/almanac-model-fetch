@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Signing keys must never be committed. The fetcher's private key is the trust
+# root for every bundle it produces; leaking it lets anyone forge a bundle that
+# an airgapped importer would accept.
+*.key
+*.sec
+minisign.key

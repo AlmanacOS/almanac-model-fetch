@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/amf-fs",
+    "crates/amf-source",
+    "crates/amf-verify",
+    "crates/amf-bundle",
+    "crates/amf-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/clemperorpenguin/almanac-model-fetch"
+
+[workspace.dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

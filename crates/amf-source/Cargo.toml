@@ -1,0 +1,30 @@
+[package]
+name = "amf-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model source backends (HuggingFace, ModelScope) for almanac-model-fetch"
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+    "gzip",
+] }
+tokio = { version = "1", features = ["rt", "macros", "fs", "io-util"] }
+bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+amf-verify = { path = "../amf-verify" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Only for the integration test asserting real variants exceed the FAT32 ceiling.
+amf-fs = { path = "../amf-fs" }
+tempfile = "3"
