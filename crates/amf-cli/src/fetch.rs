@@ -1,13 +1,18 @@
 //! `amf fetch` — the main pipeline.
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, bail, Context, Result};
 
 use amf_bundle::{
     layout, manifest, BundleWriter, C2paRecord, ContentHashStatus, Corroboration, Existing,
     FileEntry, Manifest, SignatureStatus, SourceRecord, Tool, Verification,
 };
-use amf_source::{download, RepoSpec, Source, SourceKind, Variant};
+use amf_source::{download, git_http, RepoSpec, Source, SourceKind, Variant};
+use amf_verify::chain::Evidence;
+use amf_verify::git::ObjectKind;
 
+use crate::trust::{Observation, TrustStore};
 use crate::ui;
 use crate::FetchArgs;
 
@@ -73,6 +78,19 @@ enum Outcome {
     AlreadyPresent(std::path::PathBuf),
 }
 
+/// Everything the evidence capture produced for one model.
+struct CapturedEvidence {
+    /// Raw signed commit object.
+    commit: Vec<u8>,
+    /// Tree objects by oid.
+    trees: HashMap<String, Vec<u8>>,
+    /// LFS pointer blobs by *repo path* (keyed by path for writing; the chain
+    /// walk looks them up by oid via [`Evidence`]).
+    pointers_by_path: HashMap<String, Vec<u8>>,
+    /// Chain-derived expected hash per repo path.
+    chain_hashes: HashMap<String, String>,
+}
+
 async fn fetch_one(
     args: &FetchArgs,
     backend: &dyn Source,
@@ -129,7 +147,89 @@ async fn fetch_one(
         ui::human_bytes(variant.total_size())
     ));
 
-    // 3. Work out where it goes, and whether it is already there.
+    // 3. Capture the evidence chain BEFORE downloading: signed commit, trees,
+    //    LFS pointers. The chain-derived hash then anchors the download itself,
+    //    and any disagreement with the REST API surfaces before 40 GB move.
+    let captured = capture_evidence(client, &revision, variant).await;
+    let captured = match captured {
+        Ok(c) => {
+            // Cross-check every chain-derived hash against what the REST API
+            // reported. These come over the same TLS origin but through
+            // different code paths; disagreement means either upstream is
+            // inconsistent or something is interfering — never fetch through it.
+            for file in &variant.files {
+                let rest = file.sha256.as_deref().unwrap_or_default();
+                let chain = c
+                    .chain_hashes
+                    .get(&file.path)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if !rest.eq_ignore_ascii_case(chain) {
+                    ui::alarm(
+                        "SIGNED TREE AND REST API DISAGREE",
+                        &format!(
+                            "{}: the GPG-signed git tree commits to {chain} but the \
+                             REST API reports {rest}. One of them is wrong, and \
+                             there is no safe way to pick. Aborting this fetch.",
+                            file.path
+                        ),
+                    );
+                    bail!("evidence chain and REST API disagree on {}", file.path);
+                }
+            }
+            ui::info(&format!(
+                "  evidence: signed commit + {} tree(s) + {} pointer(s), chain matches API",
+                c.trees.len(),
+                c.pointers_by_path.len(),
+            ));
+            Some(c)
+        }
+        Err(e) => {
+            ui::warn(&format!(
+                "could not capture the git evidence chain ({e:#}); continuing with \
+                 REST-reported hashes only. This bundle will not be re-derivable \
+                 offline."
+            ));
+            None
+        }
+    };
+
+    // 4. Tier 2: what does the signature on that commit actually establish?
+    let upstream_signature = match &captured {
+        Some(c) => {
+            assess_upstream_signature(backend.kind(), &c.commit, args.trust_store.as_deref())?
+        }
+        None => match backend.kind() {
+            SourceKind::HuggingFace => SignatureStatus::SignaturePresentKeyUnpinned {
+                fingerprint: None,
+            },
+            SourceKind::ModelScope => SignatureStatus::Unsigned {
+                reason: "ModelScope does not sign commits".into(),
+            },
+        },
+    };
+    if upstream_signature.is_mismatch() {
+        // The operator explicitly pinned a key, and the signature fails against
+        // it. That is the strongest attack signal this tool can see, and it is
+        // not overridable with --force: if the host genuinely rotated its key,
+        // the correct path is to re-confirm out of band and re-pin, not to
+        // shrug past a failed verification.
+        bail!(
+            "the upstream signature does not verify against the pinned key. Refusing \
+             to write a bundle. If you have re-confirmed the new key out of band, \
+             re-pin it: `amf trust remove {kind}` then `amf trust add {kind} <key.asc>`.",
+            kind = backend.kind(),
+        );
+    }
+    if args.require_signature && !upstream_signature.is_verified() {
+        bail!(
+            "--require-signature was given but the upstream signature could not be \
+             verified (status: {upstream_signature:?}). Pin HuggingFace's public key \
+             with `amf trust add huggingface <key.asc>` to enable verification."
+        );
+    }
+
+    // 5. Work out where the bundle goes, and whether it is already there.
     let files: Vec<FileEntry> = variant
         .files
         .iter()
@@ -137,6 +237,11 @@ async fn fetch_one(
             path: f.file_name().to_string(),
             sha256: f.sha256.clone().unwrap_or_default(),
             size: f.size,
+            source_path: if f.path != f.file_name() {
+                Some(f.path.clone())
+            } else {
+                None
+            },
         })
         .collect();
     let bundle_digest = manifest::compute_bundle_digest(&files);
@@ -153,10 +258,12 @@ async fn fetch_one(
         Existing::Absent => {}
     }
 
-    // 4. Preflight the destination *before* downloading anything.
+    // 6. Preflight the destination *before* downloading anything.
     preflight(args, variant)?;
 
-    // 5. Download, verifying as we stream.
+    // 7. Download, verifying as we stream — against the chain-derived hash when
+    //    we have one (it equals the REST hash; the cross-check above enforced
+    //    that), so the bytes are anchored to the signed tree.
     let writer = BundleWriter::create(bundle_path.clone()).map_err(|e| anyhow!("{e}"))?;
     let model_dir = writer.model_dir();
 
@@ -191,10 +298,54 @@ async fn fetch_one(
         ));
     }
 
-    // 6. Capture what evidence we can reach.
-    let evidence = capture_evidence(client, &writer, &revision, variant).await;
+    // 8. Write the evidence into the bundle and digest it for the manifest.
+    let mut evidence_files: Vec<FileEntry> = Vec::new();
+    if let Some(c) = &captured {
+        let mut write_evidence = |rel: String, bytes: &[u8]| -> Result<()> {
+            writer.write(&rel, bytes).map_err(|e| anyhow!("{e}"))?;
+            evidence_files.push(FileEntry {
+                path: rel,
+                sha256: sha256_hex(bytes),
+                size: bytes.len() as u64,
+                source_path: None,
+            });
+            Ok(())
+        };
 
-    // 7. Write and sign the manifest.
+        write_evidence(format!("{}/commit.obj", layout::EVIDENCE_DIR), &c.commit)?;
+        if let Ok(commit) = amf_verify::git::parse_commit(&c.commit) {
+            if let Some(sig) = commit.gpgsig {
+                write_evidence(
+                    format!("{}/commit.sig.asc", layout::EVIDENCE_DIR),
+                    sig.as_bytes(),
+                )?;
+            }
+        }
+        for (oid, tree) in &c.trees {
+            write_evidence(format!("{}/tree/{oid}.obj", layout::EVIDENCE_DIR), tree)?;
+        }
+        // Pointer files are named by blob oid, like the trees: repo basenames
+        // can collide across subdirectories (which would silently overwrite an
+        // evidence file and leave the manifest listing conflicting digests for
+        // one path), and identical blobs dedupe naturally. The verifier keys
+        // objects by recomputed id, so the filename carries no authority.
+        let pointer_blobs: std::collections::BTreeMap<String, &[u8]> = c
+            .pointers_by_path
+            .values()
+            .map(|p| {
+                (
+                    amf_verify::git::object_id(ObjectKind::Blob, p),
+                    p.as_slice(),
+                )
+            })
+            .collect();
+        for (oid, pointer) in &pointer_blobs {
+            write_evidence(format!("{}/lfs/{oid}.pointer", layout::EVIDENCE_DIR), pointer)?;
+        }
+        evidence_files.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+
+    // 9. Write and sign the manifest.
     let manifest = Manifest {
         schema_version: manifest::SCHEMA_VERSION,
         tool: Tool::default(),
@@ -210,10 +361,14 @@ async fn fetch_one(
         fetched_at: amf_bundle::now_rfc3339(),
         verification: Verification {
             content_hash: ContentHashStatus::Verified {
-                via: "rest_api".into(),
+                via: if captured.is_some() {
+                    "lfs_pointer".into()
+                } else {
+                    "rest_api".into()
+                },
             },
-            upstream_signature: upstream_signature_status(backend.kind()),
-            evidence_captured: evidence,
+            upstream_signature,
+            evidence_captured: captured.is_some(),
         },
         corroboration: if args.no_corroborate {
             Corroboration::Skipped
@@ -226,15 +381,8 @@ async fn fetch_one(
         c2pa: C2paRecord::Absent {
             searched: vec!["sidecar".into()],
         },
+        evidence_files,
     };
-
-    if args.require_signature && !manifest.verification.upstream_signature.is_verified() {
-        bail!(
-            "--require-signature was given but the upstream signature could not be \
-             verified (status: {:?}). Refusing to write the bundle.",
-            manifest.verification.upstream_signature
-        );
-    }
 
     let manifest_bytes = manifest.to_canonical_json().map_err(|e| anyhow!("{e}"))?;
     writer
@@ -242,8 +390,11 @@ async fn fetch_one(
         .map_err(|e| anyhow!("{e}"))?;
 
     if let Some(key) = &args.key {
-        let comment =
-            amf_verify::signing::trusted_comment(&manifest.source.repo, &manifest.variant, &bundle_digest);
+        let comment = amf_verify::signing::trusted_comment(
+            &manifest.source.repo,
+            &manifest.variant,
+            &bundle_digest,
+        );
         let sig = amf_verify::sign_bytes(key, None, &manifest_bytes, &comment)
             .map_err(|e| anyhow!("signing the manifest: {e}"))?;
         writer
@@ -262,34 +413,46 @@ async fn fetch_one(
     Ok(Outcome::Written(final_path))
 }
 
-/// Upstream signature status.
-///
-/// Capturing and checking the commit signature needs the raw git objects, which
-/// requires a git smart-HTTP client this build does not have yet. Until then we
-/// report exactly that rather than implying anything was checked.
-fn upstream_signature_status(kind: SourceKind) -> SignatureStatus {
-    match kind {
-        SourceKind::HuggingFace => SignatureStatus::SignaturePresentKeyUnpinned {
-            fingerprint: None,
-        },
-        SourceKind::ModelScope => SignatureStatus::Unsigned {
-            reason: "ModelScope does not sign commits".into(),
-        },
-    }
-}
-
-/// Capture the LFS pointer blobs, which are reachable over plain HTTPS.
-///
-/// The full chain also wants the signed commit and the tree objects; those need
-/// the git protocol and are not captured yet, so this returns false to keep the
-/// manifest honest about how complete the evidence is.
+/// Fetch the signed commit, its trees, and each file's LFS pointer, then walk
+/// the chain to derive every expected hash.
 async fn capture_evidence(
     client: &amf_source::reqwest::Client,
-    writer: &BundleWriter,
     revision: &amf_source::Revision,
     variant: &Variant,
-) -> bool {
-    let mut captured_any = false;
+) -> Result<CapturedEvidence> {
+    // Commit and trees over git smart-HTTP, blobs filtered.
+    let objects = git_http::fetch_commit_and_trees(
+        client,
+        amf_source::hf::DEFAULT_ENDPOINT,
+        &revision.repo.to_string(),
+        &revision.commit,
+    )
+    .await
+    .map_err(|e| anyhow!("git fetch: {e}"))?;
+
+    let mut commit_bytes: Option<Vec<u8>> = None;
+    let mut trees: HashMap<String, Vec<u8>> = HashMap::new();
+    for obj in objects {
+        match obj.kind {
+            ObjectKind::Commit if obj.oid == revision.commit => {
+                commit_bytes = Some(obj.data);
+            }
+            ObjectKind::Tree => {
+                trees.insert(obj.oid, obj.data);
+            }
+            _ => {}
+        }
+    }
+    let commit =
+        commit_bytes.ok_or_else(|| anyhow!("the pack did not contain commit {}", revision.commit))?;
+
+    // LFS pointers per file over plain HTTPS (/raw/ serves the pointer text).
+    let mut pointers_by_path = HashMap::new();
+    let mut evidence = Evidence {
+        commit: commit.clone(),
+        trees: trees.clone(),
+        ..Default::default()
+    };
     for file in &variant.files {
         let url = format!(
             "{}/{}/raw/{}/{}",
@@ -298,23 +461,141 @@ async fn capture_evidence(
             revision.commit,
             file.path
         );
-        let Ok(resp) = client.get(&url).send().await else {
-            continue;
-        };
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow!("fetching pointer for {}: {e}", file.path))?;
         if !resp.status().is_success() {
-            continue;
+            bail!("pointer fetch for {} returned HTTP {}", file.path, resp.status());
         }
-        let Ok(body) = resp.bytes().await else { continue };
-        if amf_verify::lfs::looks_like_pointer(&body) {
-            let rel = format!("{}/lfs/{}.pointer", layout::EVIDENCE_DIR, file.file_name());
-            if writer.write(&rel, &body).is_ok() {
-                captured_any = true;
+        // Pointers are ~130 bytes; cap the read so a server that answers with
+        // the real model file (or garbage) cannot balloon memory.
+        let body = git_http::read_body_capped(resp, &url, 64 * 1024)
+            .await
+            .map_err(|e| anyhow!("reading pointer for {}: {e}", file.path))?;
+        if !amf_verify::lfs::looks_like_pointer(&body) {
+            bail!("{} did not serve an LFS pointer", file.path);
+        }
+        let oid = amf_verify::git::object_id(ObjectKind::Blob, &body);
+        evidence.pointers.insert(oid, body.clone());
+        pointers_by_path.insert(file.path.clone(), body);
+    }
+
+    // Walk the chain for every file. This verifies each object against the id
+    // its parent named, so a bad tree or swapped pointer fails here.
+    let mut chain_hashes = HashMap::new();
+    for file in &variant.files {
+        let result = amf_verify::derive_expected_hash(&evidence, &revision.commit, &file.path)
+            .map_err(|e| anyhow!("chain derivation for {}: {e}", file.path))?;
+        if result.size != file.size {
+            bail!(
+                "{}: signed tree says {} bytes, REST API says {}",
+                file.path,
+                result.size,
+                file.size
+            );
+        }
+        chain_hashes.insert(file.path.clone(), result.sha256);
+    }
+
+    Ok(CapturedEvidence {
+        commit,
+        trees,
+        pointers_by_path,
+        chain_hashes,
+    })
+}
+
+/// Tier-2 assessment of the captured commit, per the continuity-vs-verification
+/// split: a pinned key gets real verification; otherwise the issuer fingerprint
+/// is recorded as an observation and the status never claims more than that.
+fn assess_upstream_signature(
+    kind: SourceKind,
+    raw_commit: &[u8],
+    trust_store: Option<&std::path::Path>,
+) -> Result<SignatureStatus> {
+    let commit = amf_verify::git::parse_commit(raw_commit).map_err(|e| anyhow!("{e}"))?;
+    let Some(armored_sig) = commit.gpgsig.as_deref() else {
+        return Ok(SignatureStatus::Unsigned {
+            reason: format!("the {kind} commit carries no signature"),
+        });
+    };
+
+    let issuer = amf_verify::pgpsig::issuer_fingerprint(armored_sig).ok();
+    let issuer_id = issuer.as_ref().and_then(|i| i.best().map(str::to_string));
+
+    // Honor the same override `amf trust` takes, so a pin made with
+    // --trust-store is actually consulted here rather than silently missed.
+    let store_path = trust_store
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(TrustStore::default_path);
+    let mut store = TrustStore::load(&store_path)?;
+    let host = kind.to_string();
+
+    if let Some(pinned) = store.pinned_key(&host) {
+        // A key is pinned: verify for real. Any failure here is a mismatch, and
+        // a mismatch is the loudest thing this tool can say.
+        match amf_verify::pgpsig::verify_commit_signature(raw_commit, &pinned.armored) {
+            Ok(v) => {
+                ui::info(&format!(
+                    "  upstream signature VERIFIED against pinned key {}",
+                    v.fingerprint
+                ));
+                return Ok(SignatureStatus::Verified {
+                    fingerprint: v.fingerprint,
+                });
+            }
+            Err(_) => {
+                ui::alarm(
+                    "UPSTREAM SIGNATURE DOES NOT MATCH THE PINNED KEY",
+                    &format!(
+                        "The commit's signature failed verification against the pinned \
+                         key {} for {host}. Either the host rotated its key, or someone \
+                         is signing commits who should not be. Do not trust this fetch \
+                         until you have re-confirmed the key out of band.",
+                        pinned.fingerprint
+                    ),
+                );
+                return Ok(SignatureStatus::SignaturePresentKeyMismatch {
+                    expected_fingerprint: pinned.fingerprint.clone(),
+                    actual_fingerprint: issuer_id,
+                });
             }
         }
     }
-    // Deliberately not `captured_any`: pointers alone are not the full chain.
-    let _ = captured_any;
-    false
+
+    // No pinned key: observation only.
+    if let Some(fp) = &issuer_id {
+        match store.record_observation(&host, fp) {
+            Observation::First => ui::info(&format!(
+                "  upstream signature present; claimed signer {fp} recorded \
+                 (first sighting, not verified — no key is pinned for {host})"
+            )),
+            Observation::Consistent => {}
+            Observation::Changed { previous } => ui::alarm(
+                "CLAIMED SIGNING KEY CHANGED",
+                &format!(
+                    "Signatures from {host} previously claimed key {previous}; this \
+                     commit claims {fp}. Without a pinned key this cannot be \
+                     verified either way — it may be a legitimate rotation or an \
+                     attack. Confirm out of band before trusting this fetch."
+                ),
+            ),
+        }
+        store.save(&store_path)?;
+    }
+
+    Ok(SignatureStatus::SignaturePresentKeyUnpinned {
+        fingerprint: issuer_id,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }
 
 fn preflight(args: &FetchArgs, variant: &Variant) -> Result<()> {

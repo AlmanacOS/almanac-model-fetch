@@ -21,6 +21,12 @@ amf fetch unsloth/Qwen3-8B-GGUF:UD-Q4_K_XL unsloth/DeepSeek-R1-GGUF:UD-IQ1_S \
 # On the airgapped machine — no network, no keyserver, no clock needed.
 amf verify /mnt/usb --public-key amf.pub
 amf list /mnt/usb
+
+# If you have obtained the upstream host's signing key out of band, pin it
+# (enables real Tier-2 verification on every subsequent fetch) and use it to
+# check the captured commit signature on the airgapped side too:
+amf trust add huggingface hf-signing-key.asc
+amf verify /mnt/usb --public-key amf.pub --upstream-key hf-signing-key.asc
 ```
 
 Repo specs are `org/name[@revision][:variant]`. Omit the variant to get an
@@ -33,9 +39,14 @@ SHA rather than the branch name.
 ```
 <usb>/almanac/models/<org>__<repo>__<variant>__<digest12>/
 ├── model/…                     the GGUF file, or the whole shard set
-├── manifest.json               the signed root — commits to every file hash
+├── manifest.json               the signed root — commits to every file hash,
+│                               including every evidence file's
 ├── manifest.json.minisig       ed25519 detached signature
-└── evidence/                   captured upstream provenance
+└── evidence/
+    ├── commit.obj              the GPG-signed commit, byte-for-byte
+    ├── commit.sig.asc          its signature, extracted
+    ├── tree/<oid>.obj          tree objects on the path to each file
+    └── lfs/<name>.pointer      the LFS pointers naming each SHA256
 ```
 
 The directory name is content-addressed, so re-fetching the same variant at the
@@ -52,7 +63,12 @@ claimed more strongly than what was actually checked:
    are checked exactly as strictly as fresh ones.
 2. **Upstream signature** — HuggingFace GPG-signs its commits, and that signature
    covers the tree, which covers the LFS pointer, which names the SHA256 we
-   verify against. See "Status" for how much of this is wired up today.
+   verify against. The signed commit and trees are captured into the bundle over
+   git smart-HTTP, the chain is cross-checked against the REST API before any
+   bytes download, and `amf verify` re-derives it offline. Without key material
+   the signature is *observed* (issuer fingerprint recorded, changes alarmed),
+   never claimed verified; pin the host's public key with `amf trust add` to get
+   real verification, and a pinned-key mismatch hard-fails the fetch.
 3. **Bundle signature** — the fetcher signs the manifest with minisign. This is
    the tier an airgapped importer should gate on, and the only trust root fully
    under your control.
@@ -77,20 +93,27 @@ Working and exercised against live HuggingFace:
 - Offline `verify` that detects both a flipped byte in a model and an edited
   manifest.
 
+Also working, since the Tier-2 milestone:
+
+- **Full git evidence capture**: signed commit + trees over a hand-rolled git
+  protocol-v2 smart-HTTP client (`filter blob:none`, `deepen 1`, own packfile
+  parser with delta support), LFS pointers over `/raw/`; every object verified
+  against its OID; `content_hash.via` is `lfs_pointer` and the chain-derived
+  hash anchors the download. Chain-vs-REST disagreement aborts the fetch loudly.
+- **Tier-2 signature handling** per the continuity/verification split: issuer
+  fingerprints observed and alarmed on change; `amf trust add` pins a real key
+  and enables cryptographic verification (rpgp); pinned-key mismatch hard-fails.
+- **Offline chain re-derivation** in `amf verify`, plus `--upstream-key` to
+  check the captured commit signature airgapped.
+
 Not yet implemented — the manifest reports these accurately rather than
 pretending otherwise:
 
-- **Full git evidence capture.** LFS pointer blobs are captured over plain HTTPS,
-  but the signed commit and tree objects need a git smart-HTTP client, so
-  `evidence_captured` is `false` and `content_hash.via` is `rest_api` rather than
-  `lfs_pointer`. The verification machinery for the full chain is written and
-  tested against real HuggingFace objects (`crates/amf-verify/tests/real_chain.rs`);
-  it is the fetch-side capture that is missing.
-- **Tier 2 signature checking.** Reported as `signature_present_key_unpinned`,
-  which is the truth: HuggingFace does not publish its signing key.
 - **ModelScope backend** and cross-source corroboration.
 - **C2PA detection** beyond the sidecar case.
 - **Cross-compilation** via cargo-zigbuild.
+- **HF's signing key remains unpublished**, so Tier 2 on a fresh install is
+  observation-only until you obtain and pin the key out of band.
 
 ## Tests
 

@@ -22,6 +22,9 @@ bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 amf-verify = { path = "../amf-verify" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha1 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

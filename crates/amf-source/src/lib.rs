@@ -6,8 +6,10 @@
 //! bundle came from, beyond what the manifest records about it.
 
 pub mod download;
+pub mod git_http;
 pub mod hf;
 pub mod model;
+pub mod pack;
 pub mod spec;
 pub mod variant;
 

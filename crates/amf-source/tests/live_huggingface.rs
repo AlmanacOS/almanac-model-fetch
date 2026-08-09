@@ -171,3 +171,25 @@ async fn a_wrong_expected_hash_is_rejected() {
 
     assert!(err.to_string().contains("hash mismatch"), "got: {err}");
 }
+
+#[tokio::test]
+#[ignore = "requires network access to huggingface.co"]
+async fn fetches_the_signed_commit_and_trees_over_smart_http() {
+    let client = http_client("almanac-model-fetch/0.1.0 (test)").unwrap();
+    let objects = amf_source::git_http::fetch_commit_and_trees(
+        &client,
+        amf_source::hf::DEFAULT_ENDPOINT,
+        "unsloth/Qwen3-8B-GGUF",
+        "a6adef130ffb23ddaf1a62fec9dced968c9bc482",
+    )
+    .await
+    .unwrap();
+
+    use amf_verify::git::ObjectKind;
+    let commit = objects.iter().find(|o| o.kind == ObjectKind::Commit).unwrap();
+    assert_eq!(commit.oid, "a6adef130ffb23ddaf1a62fec9dced968c9bc482");
+    let parsed = amf_verify::git::parse_commit(&commit.data).unwrap();
+    assert!(parsed.is_signed());
+    assert!(objects.iter().any(|o| o.kind == ObjectKind::Tree
+        && o.oid == "116f6efcc6377fce0d8d0917bc15c3126dcec5b9"));
+}

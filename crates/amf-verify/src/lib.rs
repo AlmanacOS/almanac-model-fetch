@@ -9,6 +9,7 @@ pub mod chain;
 pub mod git;
 pub mod hash;
 pub mod lfs;
+pub mod pgpsig;
 pub mod signing;
 
 pub use chain::{derive_expected_hash, ChainResult, Evidence};

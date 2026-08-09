@@ -85,10 +85,8 @@ explicitly weaker record.
 The fetcher signs `manifest.json` with ed25519 in minisign format; the signed
 trusted-comment also names the bundle digest, so a signature cannot be lifted
 onto a different bundle. The manifest commits to every model file's hash, so the
-signature covers the model transitively. (It does not yet commit to the
-`evidence/` files — adding evidence digests to the manifest lands with full
-capture in §10 step 6, and until then evidence files authenticate themselves by
-their git OIDs rather than through the signature.) The airgapped box holds only
+signature covers the model transitively. The manifest also carries digests of every
+`evidence/` file, so the signature covers the evidence transitively too. The airgapped box holds only
 the public key, pre-provisioned out of band. No PKI, no network, no
 transparency log.
 
@@ -124,12 +122,13 @@ fixed struct field order, so no `preserve_order` feature is needed) ·
 `indicatif` · `dialoguer` · `minisign` · `libc`/`windows-sys` for §7 ·
 `thiserror`/`anyhow`.
 
-An OpenPGP library lands with the Tier-2 verification work (§2). The choice
-there is a pure-Rust implementation (`sequoia-openpgp`, falling back to `rpgp`
-if it fights the musl/Windows targets) rather than shelling out to `gpg`:
-static binary, no external dependency on the target, and parsing signatures
-in-process avoids the classic "trusted the exit code of a program that wasn't
-there" failure.
+OpenPGP is `pgp` (rpgp) — pure Rust, so it does not fight the static-musl
+goal the way sequoia's default C-nettle backend would; the plan's original
+first choice was sequoia with rpgp as fallback, and the musl concern decided
+it. Either way, no shelling out to `gpg`: static binary, no external
+dependency on the target, and parsing signatures in-process avoids the classic
+"trusted the exit code of a program that wasn't there" failure. Git packfile
+inflation is `flate2` (rust backend).
 
 ---
 
@@ -331,8 +330,10 @@ A revision is pinned in the spec itself (`org/name@<rev>`); there is no separate
 `--revision` flag. Without `--key` the bundle is written unsigned, with a loud
 warning that the airgapped side can then check contents but not origin.
 
-Planned, landing with the Tier-2 rework (§2): `amf trust`, managing the pinned
-**keys** and, separately, the observed-fingerprint history.
+`amf trust list|add|remove` manages the pinned **keys** and shows, separately,
+the observed-fingerprint history (store location: the user config dir, or
+`$AMF_TRUST_STORE`). `amf verify` additionally takes `--upstream-key` to check
+the captured commit signature offline.
 
 `amf verify` deliberately requires no network and no HF key: it re-derives the
 Tier-1 chain and checks the Tier-3 signature. It is the command the airgapped
@@ -361,8 +362,15 @@ implements.
    HF commit; the fetch-side capture of commit/tree objects is not).
 4. ✅ `amf-bundle`: manifest schema, content-addressed naming, atomic write, dedup.
 5. ✅ Download pipeline: streaming verify, Range resume, progress.
-6. ⬜ Tier 2: git smart-HTTP capture of commit/tree objects, OpenPGP signature
-   parsing, key-pinning trust store (per the §2 continuity-vs-verification split).
+6. ✅ Tier 2: git smart-HTTP capture of commit/tree objects (protocol v2,
+   `filter blob:none`, `deepen 1`, hand-rolled pack parser with delta support),
+   OpenPGP signature handling via rpgp, and the key-pinning trust store with
+   separate observed-fingerprint history. The chain-derived hash is cross-checked
+   against the REST API before download and anchors the download itself;
+   `manifest.json` gains `evidence_files` digests so the Tier-3 signature covers
+   the evidence, and `amf verify` re-derives the whole chain offline
+   (`--upstream-key` checks the commit signature airgapped). A pinned-key
+   mismatch hard-fails the fetch, not overridable.
 7. ✅ Tier 3: minisign keygen, sign, verify; `amf verify` subcommand.
 8. ⬜ ModelScope backend against the same trait; corroboration.
 9. ⬜ C2PA detection (sidecar / GGUF KV / JUMBF box); sidecar-absence recording

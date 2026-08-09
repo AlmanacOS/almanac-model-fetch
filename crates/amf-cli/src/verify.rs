@@ -2,11 +2,23 @@
 //!
 //! This is the command the airgapped operator runs. It needs no network, no
 //! keyserver, and no access to HuggingFace: everything it checks is either in
-//! the bundle or in a public key provisioned out of band.
+//! the bundle or in key material provisioned out of band.
+//!
+//! What gets checked, strongest first:
+//! 1. every model file hashes to what the manifest says;
+//! 2. the manifest's bundle digest matches the files it lists;
+//! 3. every evidence file hashes to what the manifest says;
+//! 4. when evidence is present, the git chain is *re-derived*: commit → trees
+//!    → LFS pointers → the same SHA256s, all content-addressed;
+//! 5. the fetcher's bundle signature (with `--public-key`);
+//! 6. the upstream commit signature (with `--upstream-key`).
+
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use amf_bundle::{layout, Manifest};
+use amf_verify::chain::Evidence;
 
 use crate::ui;
 use crate::VerifyArgs;
@@ -24,10 +36,17 @@ pub fn run(args: VerifyArgs) -> Result<()> {
         ),
         None => None,
     };
+    let upstream_key = match &args.upstream_key {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .with_context(|| format!("reading upstream key {}", p.display()))?,
+        ),
+        None => None,
+    };
 
     let mut failed = 0usize;
     for bundle in &bundles {
-        match verify_one(bundle, public_key.as_deref()) {
+        match verify_one(bundle, public_key.as_deref(), upstream_key.as_deref()) {
             Ok(()) => {}
             Err(e) => {
                 failed += 1;
@@ -43,7 +62,11 @@ pub fn run(args: VerifyArgs) -> Result<()> {
     Ok(())
 }
 
-fn verify_one(bundle: &std::path::Path, public_key: Option<&str>) -> Result<()> {
+fn verify_one(
+    bundle: &std::path::Path,
+    public_key: Option<&str>,
+    upstream_key: Option<&str>,
+) -> Result<()> {
     ui::step(&format!("verifying {}", bundle.display()));
 
     let manifest_path = bundle.join(layout::MANIFEST_FILE);
@@ -52,9 +75,10 @@ fn verify_one(bundle: &std::path::Path, public_key: Option<&str>) -> Result<()> 
     let manifest = Manifest::from_json(&manifest_bytes)
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-    // 1. Every file must hash to what the manifest says.
+    // 1. Every model file must hash to what the manifest says.
     let model_dir = bundle.join(layout::MODEL_DIR);
     for entry in &manifest.files {
+        ensure_inside_bundle(&entry.path)?;
         let path = model_dir.join(&entry.path);
         let actual = amf_verify::hash_file(&path)
             .map_err(|e| anyhow!("hashing {}: {e}", path.display()))?;
@@ -78,7 +102,81 @@ fn verify_one(bundle: &std::path::Path, public_key: Option<&str>) -> Result<()> 
         );
     }
 
-    // 3. The signature, if we were given a key to check it with.
+    // 3. Evidence files are covered by the manifest (and so by its signature).
+    for entry in &manifest.evidence_files {
+        ensure_inside_bundle(&entry.path)?;
+        let path = bundle.join(&entry.path);
+        let actual = amf_verify::hash_file(&path)
+            .map_err(|e| anyhow!("hashing evidence {}: {e}", path.display()))?;
+        if !actual.eq_ignore_ascii_case(&entry.sha256) {
+            bail!(
+                "evidence file {} does not match the manifest (expected {}, got {actual})",
+                entry.path,
+                entry.sha256
+            );
+        }
+    }
+
+    // 4. Re-derive the git chain from the evidence, fully offline.
+    let evidence_dir = bundle.join(layout::EVIDENCE_DIR);
+    let commit_path = evidence_dir.join("commit.obj");
+    if commit_path.exists() {
+        let evidence = load_evidence(&evidence_dir)?;
+
+        // The commit in the bundle must be the commit the manifest names.
+        amf_verify::git::verify_object_id(
+            amf_verify::git::ObjectKind::Commit,
+            &evidence.commit,
+            &manifest.source.commit,
+        )
+        .map_err(|e| anyhow!("evidence commit: {e}"))?;
+
+        for entry in &manifest.files {
+            let result = amf_verify::derive_expected_hash(
+                &evidence,
+                &manifest.source.commit,
+                entry.tree_path(),
+            )
+            .map_err(|e| anyhow!("chain re-derivation for {}: {e}", entry.path))?;
+            if !result.sha256.eq_ignore_ascii_case(&entry.sha256) {
+                bail!(
+                    "{}: the signed tree commits to {} but the manifest (and file) \
+                     carry {} — the chain does not vouch for this file",
+                    entry.path,
+                    result.sha256,
+                    entry.sha256
+                );
+            }
+        }
+        ui::info(&format!(
+            "  evidence chain re-derived: commit {} → {} file hash(es), all content-addressed",
+            &manifest.source.commit[..12],
+            manifest.files.len()
+        ));
+
+        // 6. Upstream commit signature, if the operator holds the signer's key.
+        if let Some(key) = upstream_key {
+            let v = amf_verify::pgpsig::verify_commit_signature(&evidence.commit, key)
+                .map_err(|e| anyhow!("upstream signature: {e}"))?;
+            ui::info(&format!(
+                "  upstream commit signature VERIFIED against {}",
+                v.fingerprint
+            ));
+        }
+    } else {
+        if upstream_key.is_some() {
+            bail!(
+                "--upstream-key was given but this bundle carries no evidence/commit.obj \
+                 to verify"
+            );
+        }
+        ui::warn(
+            "this bundle carries no git evidence; the chain cannot be re-derived \
+             offline. Contents still match the manifest.",
+        );
+    }
+
+    // 5. The fetcher's bundle signature.
     let sig_path = bundle.join(layout::SIGNATURE_FILE);
     match (public_key, sig_path.exists()) {
         (Some(key), true) => {
@@ -93,7 +191,7 @@ fn verify_one(bundle: &std::path::Path, public_key: Option<&str>) -> Result<()> 
                     verified.trusted_comment
                 );
             }
-            ui::info("  signature verified");
+            ui::info("  bundle signature verified");
         }
         (Some(_), false) => bail!(
             "a public key was supplied but this bundle has no {}",
@@ -109,7 +207,7 @@ fn verify_one(bundle: &std::path::Path, public_key: Option<&str>) -> Result<()> 
         ),
     }
 
-    // 4. Report, without overclaiming, what upstream verification was recorded.
+    // Report, without overclaiming, what upstream verification was recorded.
     if manifest.verification.upstream_signature.is_mismatch() {
         ui::alarm(
             "UPSTREAM SIGNATURE MISMATCH RECORDED",
@@ -125,6 +223,60 @@ fn verify_one(bundle: &std::path::Path, public_key: Option<&str>) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Refuse manifest paths that could escape the bundle.
+///
+/// Until the bundle signature is checked, every path in the manifest is
+/// attacker-suppliable; joining one containing `..` (or an absolute path)
+/// would make the verifier read — and echo the hash of — arbitrary files.
+fn ensure_inside_bundle(path: &str) -> Result<()> {
+    use std::path::Component;
+    let ok = !path.is_empty()
+        && std::path::Path::new(path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    if !ok {
+        bail!("manifest path {path:?} is not a plain relative path inside the bundle");
+    }
+    Ok(())
+}
+
+/// Load the evidence directory into the structure the chain walker wants.
+///
+/// Objects are keyed by their *computed* ids — the filenames are convenience,
+/// not authority, so a renamed or swapped file changes nothing.
+fn load_evidence(evidence_dir: &std::path::Path) -> Result<Evidence> {
+    let commit = std::fs::read(evidence_dir.join("commit.obj"))
+        .with_context(|| "reading evidence/commit.obj".to_string())?;
+
+    let mut trees = HashMap::new();
+    let tree_dir = evidence_dir.join("tree");
+    if let Ok(entries) = std::fs::read_dir(&tree_dir) {
+        for e in entries.flatten() {
+            let bytes = std::fs::read(e.path())
+                .with_context(|| format!("reading {}", e.path().display()))?;
+            let oid = amf_verify::git::object_id(amf_verify::git::ObjectKind::Tree, &bytes);
+            trees.insert(oid, bytes);
+        }
+    }
+
+    let mut pointers = HashMap::new();
+    let lfs_dir = evidence_dir.join("lfs");
+    if let Ok(entries) = std::fs::read_dir(&lfs_dir) {
+        for e in entries.flatten() {
+            let bytes = std::fs::read(e.path())
+                .with_context(|| format!("reading {}", e.path().display()))?;
+            let oid = amf_verify::git::object_id(amf_verify::git::ObjectKind::Blob, &bytes);
+            pointers.insert(oid, bytes);
+        }
+    }
+
+    Ok(Evidence {
+        commit,
+        trees,
+        pointers,
+    })
 }
 
 /// Accept either a bundle directory or a drive holding many.

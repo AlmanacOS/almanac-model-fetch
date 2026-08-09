@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 mod fetch;
 mod keys;
 mod list;
+mod trust;
 mod ui;
 mod verify;
 
@@ -37,6 +38,33 @@ enum Command {
     List(ListArgs),
     /// Generate the fetcher's signing keypair.
     Keygen(KeygenArgs),
+    /// Manage pinned upstream signing keys and observed-fingerprint history.
+    Trust(TrustArgs),
+}
+
+#[derive(Parser)]
+pub struct TrustArgs {
+    #[command(subcommand)]
+    pub command: TrustCommand,
+
+    /// Trust store location (default: the user config dir, or $AMF_TRUST_STORE).
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub enum TrustCommand {
+    /// Show pinned keys and every fingerprint ever observed.
+    List,
+    /// Pin a host's public key, enabling Tier-2 verification for it.
+    Add {
+        /// Host the key belongs to, e.g. "huggingface".
+        host: String,
+        /// Path to the armored public key file.
+        key_file: PathBuf,
+    },
+    /// Remove a host's pinned key.
+    Remove { host: String },
 }
 
 #[derive(Parser)]
@@ -77,6 +105,12 @@ pub struct FetchArgs {
     /// Secret key used to sign the bundle manifest.
     #[arg(long, value_name = "PATH")]
     pub key: Option<PathBuf>,
+
+    /// Trust store location (default: the user config dir, or $AMF_TRUST_STORE).
+    /// Must match the store `amf trust` was pointed at, or pinned keys will not
+    /// be found.
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -87,6 +121,11 @@ pub struct VerifyArgs {
     /// Public key to check the bundle signature against.
     #[arg(long, value_name = "PATH")]
     pub public_key: Option<PathBuf>,
+
+    /// Armored PGP public key to verify the captured upstream commit signature
+    /// against (e.g. HuggingFace's signing key, obtained out of band).
+    #[arg(long, value_name = "PATH")]
+    pub upstream_key: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -131,6 +170,7 @@ fn main() -> std::process::ExitCode {
         Command::Verify(args) => verify::run(args),
         Command::List(args) => list::run(args),
         Command::Keygen(args) => keys::run(args),
+        Command::Trust(args) => trust::run(args),
     };
 
     match result {

@@ -28,6 +28,11 @@ pub struct Manifest {
     pub verification: Verification,
     pub corroboration: Corroboration,
     pub c2pa: C2paRecord,
+    /// Digests of everything under `evidence/`, so the bundle signature covers
+    /// the evidence transitively just as it covers the model files. Empty in
+    /// bundles written before evidence capture existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_files: Vec<FileEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +67,19 @@ pub struct FileEntry {
     pub path: String,
     pub sha256: String,
     pub size: u64,
+    /// The repo-relative path this file came from, when it differs from
+    /// `path` — sharded models live in subdirectories upstream but flat in the
+    /// bundle. The offline chain re-derivation walks the git tree by *this*
+    /// path. Absent in bundles from tool versions before evidence capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+impl FileEntry {
+    /// The path to walk in the git tree.
+    pub fn tree_path(&self) -> &str {
+        self.source_path.as_deref().unwrap_or(&self.path)
+    }
 }
 
 /// The three-tier verification record.
@@ -211,6 +229,7 @@ mod tests {
             path: path.into(),
             sha256: sha.into(),
             size,
+            source_path: None,
         }
     }
 
@@ -242,6 +261,7 @@ mod tests {
             c2pa: C2paRecord::Absent {
                 searched: vec!["sidecar".into(), "gguf_kv".into(), "jumbf_box".into()],
             },
+            evidence_files: Vec::new(),
         }
     }
 
