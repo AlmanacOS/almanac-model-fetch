@@ -73,11 +73,9 @@ pub fn derive_expected_hash(
         let entry = entries
             .iter()
             .find(|e| e.name == *component)
-            .ok_or_else(|| {
-                VerifyError::PathNotInTree {
-                    path: path.to_string(),
-                    component: component.to_string(),
-                }
+            .ok_or_else(|| VerifyError::PathNotInTree {
+                path: path.to_string(),
+                component: component.to_string(),
             })?;
 
         let last = i == components.len() - 1;
@@ -135,10 +133,8 @@ mod tests {
     }
 
     fn pointer(hash: &str, size: u64) -> Vec<u8> {
-        format!(
-            "version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\nsize {size}\n"
-        )
-        .into_bytes()
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\nsize {size}\n")
+            .into_bytes()
     }
 
     /// A one-file repo: commit -> root tree -> pointer blob.
@@ -150,10 +146,9 @@ mod tests {
         let root = tree(&[("100644", "model.gguf", &blob_oid)]);
         let root_oid = object_id(ObjectKind::Tree, &root);
 
-        let commit = format!(
-            "tree {root_oid}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nmsg\n"
-        )
-        .into_bytes();
+        let commit =
+            format!("tree {root_oid}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nmsg\n")
+                .into_bytes();
         let commit_oid = object_id(ObjectKind::Commit, &commit);
 
         let mut ev = Evidence {
@@ -186,8 +181,7 @@ mod tests {
         let root = tree(&[("40000", "Q4_K_M", &sub_oid)]);
         let root_oid = object_id(ObjectKind::Tree, &root);
 
-        let commit =
-            format!("tree {root_oid}\ncommitter A <a@x> 1 +0000\n\nm\n").into_bytes();
+        let commit = format!("tree {root_oid}\ncommitter A <a@x> 1 +0000\n\nm\n").into_bytes();
         let commit_oid = object_id(ObjectKind::Commit, &commit);
 
         let mut ev = Evidence {
@@ -198,8 +192,7 @@ mod tests {
         ev.trees.insert(sub_oid.clone(), sub);
         ev.pointers.insert(blob_oid.clone(), blob);
 
-        let r = derive_expected_hash(&ev, &commit_oid, "Q4_K_M/shard-00001-of-00002.gguf")
-            .unwrap();
+        let r = derive_expected_hash(&ev, &commit_oid, "Q4_K_M/shard-00001-of-00002.gguf").unwrap();
         assert_eq!(r.sha256, content_hash);
         assert_eq!(r.tree_path, vec![root_oid, sub_oid]);
         assert_eq!(r.blob_oid, blob_oid);
@@ -225,7 +218,8 @@ mod tests {
     fn a_tampered_tree_breaks_the_chain() {
         let (mut ev, commit_oid, _) = flat_fixture();
         let oid = ev.trees.keys().next().unwrap().clone();
-        ev.trees.insert(oid, tree(&[("100644", "evil.gguf", &"d".repeat(40))]));
+        ev.trees
+            .insert(oid, tree(&[("100644", "evil.gguf", &"d".repeat(40))]));
 
         match derive_expected_hash(&ev, &commit_oid, "model.gguf") {
             Err(VerifyError::ObjectIdMismatch { kind, .. }) => assert_eq!(kind, "tree"),
@@ -237,7 +231,10 @@ mod tests {
     fn a_wrong_commit_oid_is_rejected() {
         let (ev, _, _) = flat_fixture();
         let err = derive_expected_hash(&ev, &"e".repeat(40), "model.gguf").unwrap_err();
-        assert!(matches!(err, VerifyError::ObjectIdMismatch { kind: "commit", .. }));
+        assert!(matches!(
+            err,
+            VerifyError::ObjectIdMismatch { kind: "commit", .. }
+        ));
     }
 
     #[test]

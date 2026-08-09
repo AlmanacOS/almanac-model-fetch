@@ -6,6 +6,7 @@ members = [
     "crates/amf-verify",
     "crates/amf-bundle",
     "crates/amf-cli",
+    "xtask",
 ]
 
 [workspace.package]

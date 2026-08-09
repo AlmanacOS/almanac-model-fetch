@@ -52,7 +52,10 @@ fn real_commit_is_gpg_signed_by_huggingface() {
     );
 
     let sig = commit.gpgsig.as_ref().unwrap();
-    assert!(sig.starts_with("-----BEGIN PGP SIGNATURE-----"), "{sig:.40}");
+    assert!(
+        sig.starts_with("-----BEGIN PGP SIGNATURE-----"),
+        "{sig:.40}"
+    );
     assert!(sig.trim_end().ends_with("-----END PGP SIGNATURE-----"));
 }
 
@@ -96,11 +99,12 @@ fn full_chain_from_signed_commit_to_model_hash() {
         commit: COMMIT_RAW.to_vec(),
         ..Default::default()
     };
-    evidence.trees.insert(TREE_OID.to_string(), TREE_RAW.to_vec());
-    evidence.pointers.insert(
-        git::object_id(ObjectKind::Blob, POINTER),
-        POINTER.to_vec(),
-    );
+    evidence
+        .trees
+        .insert(TREE_OID.to_string(), TREE_RAW.to_vec());
+    evidence
+        .pointers
+        .insert(git::object_id(ObjectKind::Blob, POINTER), POINTER.to_vec());
 
     let result = derive_expected_hash(&evidence, COMMIT_OID, MODEL_PATH).unwrap();
 
@@ -132,7 +136,9 @@ fn tampering_with_the_real_commit_is_detected() {
         commit: tampered,
         ..Default::default()
     };
-    evidence.trees.insert(TREE_OID.to_string(), TREE_RAW.to_vec());
+    evidence
+        .trees
+        .insert(TREE_OID.to_string(), TREE_RAW.to_vec());
 
     let err = derive_expected_hash(&evidence, COMMIT_OID, MODEL_PATH).unwrap_err();
     assert!(err.is_integrity_failure(), "got {err:?}");

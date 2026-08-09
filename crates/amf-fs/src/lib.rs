@@ -41,7 +41,9 @@ pub enum FsError {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FsKind {
     /// FAT12/16/32. Refused outright — see [`Suitability`].
-    Fat { variant: FatVariant },
+    Fat {
+        variant: FatVariant,
+    },
     ExFat,
     Ntfs,
     Ext4,
@@ -54,7 +56,9 @@ pub enum FsKind {
     Tmpfs,
     Overlay,
     /// Recognised by the OS but not one we have an opinion about.
-    Other { name: String },
+    Other {
+        name: String,
+    },
     /// The OS gave us nothing usable.
     Unknown,
 }
@@ -287,7 +291,10 @@ mod tests {
             500 * 1024 * 1024 * 1024,
         );
         let verdict = assess(&i, 2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
-        assert!(verdict.is_refusal(), "FAT32 must be refused, got {verdict:?}");
+        assert!(
+            verdict.is_refusal(),
+            "FAT32 must be refused, got {verdict:?}"
+        );
         match verdict {
             Suitability::Refuse(msg) => {
                 assert!(msg.contains("FAT32"), "message should name the fs: {msg}");

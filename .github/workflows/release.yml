@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # musl and Windows build in the pinned container, so they are reproducible
+  # from any machine that can run it.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SOURCE_DATE_EPOCH comes from the commit
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo xtask image
+      - run: cargo xtask dist --verify-reproducible
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-windows
+          path: dist/out/amf-*
+
+  # Apple targets build natively here rather than against a vendored SDK. This
+  # is the licensing-clean path; `--sdkroot` exists for developers who have
+  # their own copy locally.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      # The same path remapping the container build uses. Without it the mac
+      # binaries alone would embed the runner's absolute paths, which defeats
+      # both the reproducibility claim and the privacy reason for remapping.
+      - run: |
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) \
+            RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME/.cargo=cargo" \
+              cargo build --release --locked -p amf-cli --target "$t"
+            cp "target/$t/release/amf" "amf-$t"
+          done
+      - name: Smoke-test the native artifact
+        run: ./amf-$(uname -m)-apple-darwin --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: amf-*-apple-darwin
+
+  # One SHA256SUMS over everything, signed once. Splitting the signature across
+  # jobs would mean several partial manifests, each covering a subset, which is
+  # exactly the ambiguity a checksum file exists to remove.
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble and hash
+        run: |
+          mkdir -p dist/out
+          find artifacts -type f -name 'amf-*' -exec cp {} dist/out/ \;
+          cd dist/out && sha256sum amf-* | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      # The release secret key lives only in repository secrets; the public half
+      # is committed as release-key.pub so a first-time downloader can check a
+      # binary without already having one.
+      - name: Sign SHA256SUMS
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            # Loud rather than silent: an unsigned SHA256SUMS is exactly as
+            # trustworthy as the channel it travels over, and a release that
+            # quietly skipped signing looks identical to one that did not.
+            echo "::warning title=Unsigned release::RELEASE_SIGNING_KEY is not set, so no SHA256SUMS.minisig was produced; downloaders cannot tell this SHA256SUMS from one an attacker substituted."
+            exit 0
+          fi
+          # Wipe the key even if signing fails partway.
+          trap 'shred -u release.key 2>/dev/null || rm -f release.key' EXIT
+          (umask 077 && printf '%s' "$RELEASE_SIGNING_KEY" > release.key)
+          cargo xtask sign --key release.key --file dist/out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/out/*

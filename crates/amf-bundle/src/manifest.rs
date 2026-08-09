@@ -7,12 +7,19 @@
 //!
 //! Every verification status in here is deliberately explicit about what was
 //! *not* established. A field that said only "verified: true" would force a
-//! reader to guess whether an absent C2PA manifest meant "upstream has none" or
-//! "this tool never looked", and those are very different facts.
+//! reader to guess whether a signature was checked or merely present, and those
+//! are very different facts.
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Schema of the manifest this build writes.
+///
+/// Bumped to 2 when `evidence_captured`/`chain_rederivable` became the single
+/// [`EvidenceKind`] field. Nothing had been released at 1, so no migration
+/// exists — but a version-1 bundle still deserves to be told what is wrong with
+/// it rather than a missing-field error, which is what [`Manifest::ensure_supported_schema`]
+/// is for.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -27,7 +34,6 @@ pub struct Manifest {
     pub fetched_at: String,
     pub verification: Verification,
     pub corroboration: Corroboration,
-    pub c2pa: C2paRecord,
     /// Digests of everything under `evidence/`, so the bundle signature covers
     /// the evidence transitively just as it covers the model files. Empty in
     /// bundles written before evidence capture existed.
@@ -59,6 +65,37 @@ pub struct SourceRecord {
     pub commit: String,
     /// What the operator asked for — `main`, a tag, or a SHA.
     pub requested_revision: String,
+    /// Whether `commit` is a full object id or only a prefix.
+    ///
+    /// Defaults to `commit` for bundles written before ModelScope existed: every
+    /// one of those came from HuggingFace, which always resolves a full id. The
+    /// value is redundant with `commit`'s own length on purpose — `amf verify`
+    /// cross-checks the two, so a manifest claiming exactness for a short id is
+    /// caught rather than believed.
+    #[serde(default)]
+    pub revision_precision: RevisionPrecision,
+}
+
+/// How precisely the revision could be pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionPrecision {
+    /// A full 40-hex object id.
+    #[default]
+    Commit,
+    /// Only a prefix — the host could not name its head in full.
+    Abbreviated,
+}
+
+impl RevisionPrecision {
+    /// What the commit id's own shape says it is.
+    pub fn of(commit: &str) -> Self {
+        if commit.len() == 40 {
+            RevisionPrecision::Commit
+        } else {
+            RevisionPrecision::Abbreviated
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,11 +126,49 @@ pub struct Verification {
     pub content_hash: ContentHashStatus,
     /// Tier 2 — upstream commit signature.
     pub upstream_signature: SignatureStatus,
+    /// What upstream evidence this bundle carries.
+    ///
     /// Tier 3 is the detached signature file alongside this manifest; its
     /// presence is a fact about the bundle rather than a claim inside it, so it
     /// is deliberately not recorded here. A manifest cannot vouch for its own
     /// signature.
-    pub evidence_captured: bool,
+    pub evidence: EvidenceKind,
+}
+
+/// What upstream evidence a bundle carries, and therefore what its Tier 1 rests
+/// on.
+///
+/// One field rather than a pair of booleans ("captured?", "re-derivable?"):
+/// those admit a fourth, meaningless combination, and nothing would reject a
+/// manifest asserting it. These are the three states that actually exist.
+///
+/// Note that `amf verify` does not *trust* this field — it re-derives the chain
+/// from whatever evidence is on disk and reports what it found. The value here
+/// is a description for a reader who is not running the verifier, which is
+/// exactly the reader who most needs it to be unambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// Signed commit, trees, and LFS pointers: every file's hash can be
+    /// re-derived offline, with no network and no trust in this tool's word.
+    Chain,
+    /// API responses only, stored verbatim and digest-covered by Tier 3. Tier 1
+    /// rests on the fetcher having checked hashes the host asserted over TLS —
+    /// a real but weaker claim. The state a host with no git endpoint produces.
+    RestOnly,
+    /// Nothing was captured.
+    Absent,
+}
+
+impl EvidenceKind {
+    /// Whether the airgapped side can rebuild each hash from the commit itself.
+    pub fn is_rederivable(&self) -> bool {
+        matches!(self, EvidenceKind::Chain)
+    }
+
+    pub fn was_captured(&self) -> bool {
+        !matches!(self, EvidenceKind::Absent)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +198,20 @@ pub enum SignatureStatus {
         actual_fingerprint: Option<String>,
     },
     /// The host does not sign commits at all — ModelScope's normal state.
+    ///
+    /// This is a *positive finding*: a commit object was retrieved and examined
+    /// and carried no signature. It is not the status for "we never looked".
     Unsigned { reason: String },
+    /// No commit object was ever retrieved, so nothing is known either way.
+    ///
+    /// Deliberately distinct from every other variant. If evidence capture
+    /// fails — a proxy that allows the REST API but blocks `/info/refs`, say —
+    /// the fetcher has examined no commit at all, and recording either
+    /// "signature present" or "unsigned" would state a finding it never made.
+    /// The whole point of this enum is that a reader can tell what was checked
+    /// from what was merely assumed, and "not checked" needs its own name to
+    /// stay tellable.
+    Unknown { reason: String },
 }
 
 impl SignatureStatus {
@@ -140,16 +228,43 @@ impl SignatureStatus {
     }
 }
 
+/// One file as the counterpart host reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorroboratedFile {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// One file the two hosts disagreed about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorroborationConflict {
+    pub path: String,
+    pub ours: String,
+    pub theirs: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Corroboration {
-    /// The counterpart host published the same hash.
-    Match { host: String, sha256: String },
+    /// The counterpart host published the same hash for every file checked.
+    ///
+    /// The file list is recorded rather than a count, because "the model
+    /// matched" and "the one file we bothered to check matched" are different
+    /// claims and a reader must be able to tell which one this is.
+    Match {
+        host: String,
+        repo: String,
+        files: Vec<CorroboratedFile>,
+    },
     /// The counterpart host published a *different* hash. Serious.
     Mismatch {
         host: String,
-        ours: String,
-        theirs: String,
+        repo: String,
+        conflicts: Vec<CorroborationConflict>,
+        /// Files that did agree, if any — a partial disagreement is a different
+        /// shape of problem from a wholesale one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        matched: Vec<CorroboratedFile>,
     },
     /// Could not check — usually because the other host is unreachable, which is
     /// the expected case for an operator who chose ModelScope precisely because
@@ -157,19 +272,6 @@ pub enum Corroboration {
     Unavailable { host: String, reason: String },
     /// Not attempted (`--no-corroborate`).
     Skipped,
-}
-
-/// What we found when looking for C2PA provenance.
-///
-/// As of this tool's development no Unsloth GGUF repo shipped a C2PA manifest,
-/// in any of the three places checked. Recording the absence structurally — with
-/// the list of places searched — lets a downstream reader tell "upstream has
-/// none" from "an older tool did not look", which a bare `null` could not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum C2paRecord {
-    Present { path: String, sha256: String },
-    Absent { searched: Vec<String> },
 }
 
 impl Manifest {
@@ -189,10 +291,57 @@ impl Manifest {
         serde_json::from_slice(bytes)
     }
 
+    /// Parse, checking the schema version *before* anything else.
+    ///
+    /// The order matters and is the whole point. A manifest from another schema
+    /// will usually fail to deserialise on some field that moved, and reporting
+    /// `missing field \`evidence\`` tells an operator nothing about what to do.
+    /// Reading the version from a minimal probe first means the diagnosis comes
+    /// out as "this bundle predates the current schema, re-fetch it".
+    pub fn from_json_checked(bytes: &[u8]) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        struct Probe {
+            schema_version: u32,
+        }
+
+        // A manifest without even a readable version is malformed, not merely
+        // old; let the full parse produce the detailed error for that case.
+        if let Ok(probe) = serde_json::from_slice::<Probe>(bytes) {
+            check_schema_version(probe.schema_version)?;
+        }
+        Self::from_json(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Reject a manifest this build does not understand.
+    ///
+    /// Prefer [`Manifest::from_json_checked`], which applies this before a
+    /// field mismatch can turn into a confusing parse error.
+    pub fn ensure_supported_schema(&self) -> Result<(), String> {
+        check_schema_version(self.schema_version)
+    }
+
     /// Total size of the model files.
     pub fn total_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
+}
+
+fn check_schema_version(version: u32) -> Result<(), String> {
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(if version > SCHEMA_VERSION {
+        format!(
+            "this bundle uses manifest schema {version} but this build only understands \
+             {SCHEMA_VERSION}. Upgrade amf rather than trusting an older reading of a \
+             newer manifest."
+        )
+    } else {
+        format!(
+            "this bundle uses manifest schema {version}, which predates the current \
+             schema {SCHEMA_VERSION}. Re-fetch it with this build."
+        )
+    })
 }
 
 /// Compute the digest that content-addresses a bundle.
@@ -243,6 +392,7 @@ mod tests {
                 repo: "unsloth/Qwen3-8B-GGUF".into(),
                 commit: "a6adef130ffb23ddaf1a62fec9dced968c9bc482".into(),
                 requested_revision: "main".into(),
+                revision_precision: RevisionPrecision::Commit,
             },
             variant: "Q4_K_M".into(),
             bundle_digest: compute_bundle_digest(&files),
@@ -255,12 +405,9 @@ mod tests {
                 upstream_signature: SignatureStatus::SignaturePresentKeyUnpinned {
                     fingerprint: None,
                 },
-                evidence_captured: true,
+                evidence: EvidenceKind::Chain,
             },
             corroboration: Corroboration::Skipped,
-            c2pa: C2paRecord::Absent {
-                searched: vec!["sidecar".into(), "gguf_kv".into(), "jumbf_box".into()],
-            },
             evidence_files: Vec::new(),
         }
     }
@@ -299,9 +446,18 @@ mod tests {
     fn digest_changes_with_any_field() {
         let base = vec![entry("a.gguf", &"a".repeat(64), 1)];
         let d = compute_bundle_digest(&base);
-        assert_ne!(d, compute_bundle_digest(&[entry("b.gguf", &"a".repeat(64), 1)]));
-        assert_ne!(d, compute_bundle_digest(&[entry("a.gguf", &"c".repeat(64), 1)]));
-        assert_ne!(d, compute_bundle_digest(&[entry("a.gguf", &"a".repeat(64), 2)]));
+        assert_ne!(
+            d,
+            compute_bundle_digest(&[entry("b.gguf", &"a".repeat(64), 1)])
+        );
+        assert_ne!(
+            d,
+            compute_bundle_digest(&[entry("a.gguf", &"c".repeat(64), 1)])
+        );
+        assert_ne!(
+            d,
+            compute_bundle_digest(&[entry("a.gguf", &"a".repeat(64), 2)])
+        );
     }
 
     #[test]
@@ -333,10 +489,7 @@ mod tests {
         // The crucial negative: a present-but-unchecked signature is not
         // verification, and must never be reported as such.
         assert!(!SignatureStatus::SignaturePresentKeyUnpinned { fingerprint: None }.is_verified());
-        assert!(!SignatureStatus::Unsigned {
-            reason: "x".into()
-        }
-        .is_verified());
+        assert!(!SignatureStatus::Unsigned { reason: "x".into() }.is_verified());
 
         let mismatch = SignatureStatus::SignaturePresentKeyMismatch {
             expected_fingerprint: "A".into(),
@@ -344,16 +497,103 @@ mod tests {
         };
         assert!(!mismatch.is_verified());
         assert!(mismatch.is_mismatch());
+
+        assert!(!SignatureStatus::Unknown { reason: "x".into() }.is_verified());
     }
 
     #[test]
-    fn c2pa_absence_records_where_we_looked() {
-        let json = serde_json::to_string(&C2paRecord::Absent {
-            searched: vec!["sidecar".into()],
+    fn evidence_states_cannot_contradict_each_other() {
+        // The whole reason this is one field and not two booleans: there is no
+        // way to express "nothing captured, but re-derivable".
+        assert!(EvidenceKind::Chain.is_rederivable());
+        assert!(EvidenceKind::Chain.was_captured());
+
+        // Captured, but the hashes are still only the host's assertion.
+        assert!(!EvidenceKind::RestOnly.is_rederivable());
+        assert!(EvidenceKind::RestOnly.was_captured());
+
+        assert!(!EvidenceKind::Absent.is_rederivable());
+        assert!(!EvidenceKind::Absent.was_captured());
+    }
+
+    #[test]
+    fn an_older_schema_is_diagnosed_before_a_field_mismatch_can_confuse_it() {
+        // The realistic case: a schema-1 manifest has no `evidence` field at
+        // all, so a plain parse fails with "missing field `evidence`" — true,
+        // and useless to whoever has to decide what to do about it. The version
+        // check has to happen first or it never runs.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&sample().to_canonical_json().unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(1);
+        value["verification"]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence");
+        value["verification"]["evidence_captured"] = serde_json::json!(true);
+
+        let bytes = value.to_string();
+        assert!(
+            Manifest::from_json(bytes.as_bytes()).is_err(),
+            "the plain parse should fail — that is what makes the ordering matter"
+        );
+
+        let err = Manifest::from_json_checked(bytes.as_bytes()).unwrap_err();
+        assert!(err.contains("predates"), "{err}");
+        assert!(!err.contains("missing field"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_from_another_schema_is_refused_with_a_reason() {
+        let mut m = sample();
+        assert!(m.ensure_supported_schema().is_ok());
+
+        // Older: the field meanings this build assumes were not in force yet.
+        m.schema_version = SCHEMA_VERSION - 1;
+        let err = m.ensure_supported_schema().unwrap_err();
+        assert!(err.contains("predates"), "{err}");
+
+        // Newer: refuse rather than read new fields under old meanings, which
+        // is how a verifier reports the wrong thing with full confidence.
+        m.schema_version = SCHEMA_VERSION + 1;
+        let err = m.ensure_supported_schema().unwrap_err();
+        assert!(err.contains("Upgrade amf"), "{err}");
+    }
+
+    #[test]
+    fn not_looking_is_a_distinct_status_from_finding_nothing() {
+        // These read similarly in prose and mean entirely different things:
+        // `unsigned` says a commit was fetched and carried no signature;
+        // `unknown` says no commit was fetched at all. Collapsing them would
+        // let a failed evidence capture masquerade as a finding.
+        let unsigned = serde_json::to_string(&SignatureStatus::Unsigned {
+            reason: "the modelscope commit carries no signature".into(),
         })
         .unwrap();
-        assert!(json.contains("\"status\":\"absent\""), "{json}");
-        assert!(json.contains("sidecar"), "{json}");
+        let unknown = serde_json::to_string(&SignatureStatus::Unknown {
+            reason: "evidence capture failed".into(),
+        })
+        .unwrap();
+
+        assert!(unsigned.contains("\"status\":\"unsigned\""), "{unsigned}");
+        assert!(unknown.contains("\"status\":\"unknown\""), "{unknown}");
+        assert_ne!(unsigned, unknown);
+    }
+
+    #[test]
+    fn a_legacy_manifest_carrying_a_c2pa_key_still_parses() {
+        // C2PA was removed from the spec, but bundles written before that
+        // carry a `c2pa` object. Verification re-reads the manifest *bytes*
+        // from disk rather than re-serialising, so those bundles must keep
+        // parsing — an unknown field is not a reason to reject a signed
+        // manifest that was honest when it was written.
+        let m = sample();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&m.to_canonical_json().unwrap()).unwrap();
+        value["c2pa"] = serde_json::json!({"status": "absent", "searched": ["sidecar"]});
+
+        let parsed = Manifest::from_json(value.to_string().as_bytes())
+            .expect("a legacy c2pa key must not break parsing");
+        assert_eq!(parsed, m);
     }
 
     #[test]

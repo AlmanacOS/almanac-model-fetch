@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 
 use amf_bundle::{
-    layout, manifest, BundleWriter, C2paRecord, ContentHashStatus, Corroboration, Existing,
-    FileEntry, Manifest, SignatureStatus, SourceRecord, Tool, Verification,
+    layout, manifest, BundleWriter, ContentHashStatus, Corroboration, Existing, FileEntry,
+    Manifest, SignatureStatus, SourceRecord, Tool, Verification,
 };
 use amf_source::{download, git_http, RepoSpec, Source, SourceKind, Variant};
 use amf_verify::chain::Evidence;
@@ -111,6 +111,18 @@ async fn fetch_one(
         }
     })?;
     ui::info(&format!("  commit: {}", revision.commit));
+    if !revision.precision.is_exact() {
+        // Say this once, plainly. A short id is fine against accident and
+        // useless against an adversary who can grind commits, and the operator
+        // is the one who gets to decide whether that matters here.
+        ui::warn(&format!(
+            "{} could not name its head commit in full; this bundle records the \
+             abbreviated id {}. To pin exactly, fetch {}@<full-40-hex>.",
+            backend.kind(),
+            revision.commit,
+            revision.repo,
+        ));
+    }
 
     // 2. Pick a variant.
     let variants = backend
@@ -150,7 +162,7 @@ async fn fetch_one(
     // 3. Capture the evidence chain BEFORE downloading: signed commit, trees,
     //    LFS pointers. The chain-derived hash then anchors the download itself,
     //    and any disagreement with the REST API surfaces before 40 GB move.
-    let captured = capture_evidence(client, &revision, variant).await;
+    let captured = capture_evidence(backend, client, &revision, variant).await;
     let captured = match captured {
         Ok(c) => {
             // Cross-check every chain-derived hash against what the REST API
@@ -177,8 +189,18 @@ async fn fetch_one(
                     bail!("evidence chain and REST API disagree on {}", file.path);
                 }
             }
+            // Do not call an unsigned commit "signed": on ModelScope this line
+            // would otherwise describe the exact property that host lacks.
+            let signed = amf_verify::git::parse_commit(&c.commit)
+                .map(|p| p.is_signed())
+                .unwrap_or(false);
             ui::info(&format!(
-                "  evidence: signed commit + {} tree(s) + {} pointer(s), chain matches API",
+                "  evidence: {} + {} tree(s) + {} pointer(s), chain matches API",
+                if signed {
+                    "signed commit"
+                } else {
+                    "commit (unsigned)"
+                },
                 c.trees.len(),
                 c.pointers_by_path.len(),
             ));
@@ -199,13 +221,15 @@ async fn fetch_one(
         Some(c) => {
             assess_upstream_signature(backend.kind(), &c.commit, args.trust_store.as_deref())?
         }
-        None => match backend.kind() {
-            SourceKind::HuggingFace => SignatureStatus::SignaturePresentKeyUnpinned {
-                fingerprint: None,
-            },
-            SourceKind::ModelScope => SignatureStatus::Unsigned {
-                reason: "ModelScope does not sign commits".into(),
-            },
+        // No commit object was retrieved, so no finding about a signature was
+        // made — not "present", and not "unsigned" either, even for a host we
+        // are confident never signs. Both of those are claims about a specific
+        // commit, and this fetch examined none.
+        None => SignatureStatus::Unknown {
+            reason: format!(
+                "evidence capture from {} failed, so no commit object was examined",
+                backend.kind()
+            ),
         },
     };
     if upstream_signature.is_mismatch() {
@@ -258,26 +282,62 @@ async fn fetch_one(
         Existing::Absent => {}
     }
 
-    // 6. Preflight the destination *before* downloading anything.
+    // 6. Corroborate against the other host — after the already-present check,
+    //    so re-running over a populated USB stick does not make a round trip to
+    //    a host we are not fetching from, but before the download, because a
+    //    disagreement is worth knowing about now and not at the end of an hour
+    //    of transfer.
+    let hashed_files = variant.files.iter().filter(|f| f.sha256.is_some()).count();
+    let corroboration = if args.no_corroborate {
+        Corroboration::Skipped
+    } else {
+        match crate::corroborate::target(
+            backend.kind(),
+            &revision.repo.to_string(),
+            args.corroborate_with.as_deref(),
+        ) {
+            Ok(t) => {
+                let result = crate::corroborate::run(client, &t, variant).await;
+                report_corroboration(&result, hashed_files);
+                result
+            }
+            Err(e) => bail!("{e}"),
+        }
+    };
+
+    // A partial confirmation is not a confirmation: a mirror that happens to
+    // publish one of three shards under a matching name tells us nothing about
+    // the other two, so the gate demands the whole variant.
+    let corroborated = matches!(
+        &corroboration,
+        Corroboration::Match { files, .. } if files.len() == hashed_files
+    );
+    if args.require_corroboration && !corroborated {
+        bail!(
+            "--require-corroboration was given but the other host did not confirm \
+             all {hashed_files} file(s) (result: {corroboration:?}). Point at the \
+             mirror explicitly with --corroborate-with <host>:<org/name> if it \
+             exists under another name."
+        );
+    }
+
+    // 7. Preflight the destination *before* downloading anything.
     preflight(args, variant)?;
 
-    // 7. Download, verifying as we stream — against the chain-derived hash when
+    // 8. Download, verifying as we stream — against the chain-derived hash when
     //    we have one (it equals the REST hash; the cross-check above enforced
     //    that), so the bytes are anchored to the signed tree.
     let writer = BundleWriter::create(bundle_path.clone()).map_err(|e| anyhow!("{e}"))?;
     let model_dir = writer.model_dir();
+    let endpoints = backend.endpoints();
+    let repo = revision.repo.to_string();
 
     for file in &variant.files {
         let expected = file
             .sha256
             .as_deref()
             .ok_or_else(|| anyhow!("{} has no upstream hash", file.path))?;
-        let url = download::file_url(
-            amf_source::hf::DEFAULT_ENDPOINT,
-            &revision.repo.to_string(),
-            &revision.commit,
-            &file.path,
-        );
+        let url = endpoints.file_url(&repo, &revision.commit, &file.path);
         let dest = model_dir.join(file.file_name());
 
         let bar = ui::progress_bar(file.size, file.file_name());
@@ -298,7 +358,7 @@ async fn fetch_one(
         ));
     }
 
-    // 8. Write the evidence into the bundle and digest it for the manifest.
+    // 9. Write the evidence into the bundle and digest it for the manifest.
     let mut evidence_files: Vec<FileEntry> = Vec::new();
     if let Some(c) = &captured {
         let mut write_evidence = |rel: String, bytes: &[u8]| -> Result<()> {
@@ -340,18 +400,24 @@ async fn fetch_one(
             })
             .collect();
         for (oid, pointer) in &pointer_blobs {
-            write_evidence(format!("{}/lfs/{oid}.pointer", layout::EVIDENCE_DIR), pointer)?;
+            write_evidence(
+                format!("{}/lfs/{oid}.pointer", layout::EVIDENCE_DIR),
+                pointer,
+            )?;
         }
         evidence_files.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
-    // 9. Write and sign the manifest.
+    // 10. Write and sign the manifest.
     let manifest = Manifest {
         schema_version: manifest::SCHEMA_VERSION,
         tool: Tool::default(),
         source: SourceRecord {
             host: backend.kind().to_string(),
             repo: revision.repo.to_string(),
+            // Derived from the id's own shape rather than passed alongside it,
+            // so the two can never disagree.
+            revision_precision: amf_bundle::RevisionPrecision::of(&revision.commit),
             commit: revision.commit.clone(),
             requested_revision: revision.requested.clone(),
         },
@@ -368,19 +434,18 @@ async fn fetch_one(
                 },
             },
             upstream_signature,
-            evidence_captured: captured.is_some(),
+            // `RestOnly` is unreachable today: both hosts serve git, so a
+            // capture either yields the full chain or fails outright. It is the
+            // state a host with no git endpoint would produce (ARCHITECTURE.md §7),
+            // and `HostEndpoints::git_repo_url` returning `None` is what would
+            // select it.
+            evidence: if captured.is_some() {
+                amf_bundle::EvidenceKind::Chain
+            } else {
+                amf_bundle::EvidenceKind::Absent
+            },
         },
-        corroboration: if args.no_corroborate {
-            Corroboration::Skipped
-        } else {
-            Corroboration::Unavailable {
-                host: "modelscope".into(),
-                reason: "cross-source corroboration is not implemented yet".into(),
-            }
-        },
-        c2pa: C2paRecord::Absent {
-            searched: vec!["sidecar".into()],
-        },
+        corroboration,
         evidence_files,
     };
 
@@ -413,22 +478,86 @@ async fn fetch_one(
     Ok(Outcome::Written(final_path))
 }
 
+/// Report what the other host said.
+///
+/// A mismatch is loud but not fatal, and the asymmetry with the chain-vs-REST
+/// check is deliberate. That check catches one host contradicting *itself*,
+/// which is always wrong, so it aborts. Two independent hosts can legitimately
+/// differ — a re-quantisation or a re-upload produces different bytes for the
+/// same name — so the operator is told prominently and decides. Anyone who wants
+/// it to gate has `--require-corroboration`.
+///
+/// `checked` is how many files we *asked* about, so a partial confirmation reads
+/// as one. "the same hash for 1 file(s)" on a three-shard variant would otherwise
+/// look like full agreement.
+fn report_corroboration(result: &Corroboration, checked: usize) {
+    match result {
+        Corroboration::Match { host, files, .. } => {
+            if files.len() == checked {
+                ui::info(&format!(
+                    "  corroborated: {host} publishes the same hash for all {checked} file(s)"
+                ));
+            } else {
+                ui::warn(&format!(
+                    "{host} publishes the same hash for only {} of {checked} file(s); it \
+                     named nothing matching the rest, so they rest on one host alone.",
+                    files.len()
+                ));
+            }
+        }
+        Corroboration::Mismatch {
+            host,
+            repo,
+            conflicts,
+            ..
+        } => {
+            let detail = conflicts
+                .iter()
+                .map(|c| {
+                    format!(
+                        "    {}\n      here:  {}\n      {host}: {}",
+                        c.path, c.ours, c.theirs
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            ui::alarm(
+                "TWO HOSTS DISAGREE ABOUT THIS MODEL",
+                &format!(
+                    "{host}/{repo} publishes different bytes for {} of {checked} file(s) \
+                     checked:\n{detail}\n\n  This is not automatically an attack — a \
+                     re-quantisation or re-upload can do it — but it means the two \
+                     copies are not the same artifact. The bundle records the \
+                     disagreement.",
+                    conflicts.len(),
+                ),
+            );
+        }
+        // Silent by design: an operator who chose ModelScope because HuggingFace
+        // is blocked would otherwise get a warning on every single fetch for a
+        // condition they already know about and cannot fix.
+        Corroboration::Unavailable { .. } | Corroboration::Skipped => {}
+    }
+}
+
 /// Fetch the signed commit, its trees, and each file's LFS pointer, then walk
 /// the chain to derive every expected hash.
 async fn capture_evidence(
+    backend: &dyn Source,
     client: &amf_source::reqwest::Client,
     revision: &amf_source::Revision,
     variant: &Variant,
 ) -> Result<CapturedEvidence> {
-    // Commit and trees over git smart-HTTP, blobs filtered.
-    let objects = git_http::fetch_commit_and_trees(
-        client,
-        amf_source::hf::DEFAULT_ENDPOINT,
-        &revision.repo.to_string(),
-        &revision.commit,
-    )
-    .await
-    .map_err(|e| anyhow!("git fetch: {e}"))?;
+    // Commit and trees over git smart-HTTP, blobs filtered. A host with no git
+    // endpoint says so here rather than at request time, and the caller degrades
+    // to REST-reported hashes.
+    let repo_url = backend
+        .endpoints()
+        .git_repo_url(&revision.repo.to_string())
+        .ok_or_else(|| anyhow!("{} serves no git endpoint", backend.kind()))?;
+    let objects = git_http::fetch_commit_and_trees(client, &repo_url, &revision.commit)
+        .await
+        .map_err(|e| anyhow!("git fetch: {e}"))?;
 
     let mut commit_bytes: Option<Vec<u8>> = None;
     let mut trees: HashMap<String, Vec<u8>> = HashMap::new();
@@ -443,8 +572,8 @@ async fn capture_evidence(
             _ => {}
         }
     }
-    let commit =
-        commit_bytes.ok_or_else(|| anyhow!("the pack did not contain commit {}", revision.commit))?;
+    let commit = commit_bytes
+        .ok_or_else(|| anyhow!("the pack did not contain commit {}", revision.commit))?;
 
     // LFS pointers per file over plain HTTPS (/raw/ serves the pointer text).
     let mut pointers_by_path = HashMap::new();
@@ -454,26 +583,14 @@ async fn capture_evidence(
         ..Default::default()
     };
     for file in &variant.files {
-        let url = format!(
-            "{}/{}/raw/{}/{}",
-            amf_source::hf::DEFAULT_ENDPOINT,
-            revision.repo,
-            revision.commit,
-            file.path
-        );
-        let resp = client
-            .get(&url)
-            .send()
+        // How a host serves pointer text differs (a `/raw/` path on one, a JSON
+        // envelope on the other), so the backend owns the retrieval. Whatever
+        // comes back is checked against the blob id in the signed tree below,
+        // which is what makes trusting the transport unnecessary.
+        let body = backend
+            .fetch_pointer(revision, &file.path)
             .await
             .map_err(|e| anyhow!("fetching pointer for {}: {e}", file.path))?;
-        if !resp.status().is_success() {
-            bail!("pointer fetch for {} returned HTTP {}", file.path, resp.status());
-        }
-        // Pointers are ~130 bytes; cap the read so a server that answers with
-        // the real model file (or garbage) cannot balloon memory.
-        let body = git_http::read_body_capped(resp, &url, 64 * 1024)
-            .await
-            .map_err(|e| anyhow!("reading pointer for {}: {e}", file.path))?;
         if !amf_verify::lfs::looks_like_pointer(&body) {
             bail!("{} did not serve an LFS pointer", file.path);
         }
@@ -517,6 +634,13 @@ fn assess_upstream_signature(
 ) -> Result<SignatureStatus> {
     let commit = amf_verify::git::parse_commit(raw_commit).map_err(|e| anyhow!("{e}"))?;
     let Some(armored_sig) = commit.gpgsig.as_deref() else {
+        // Worth stating rather than leaving as silence: an operator reading this
+        // output should be able to see that Tier 2 established nothing here,
+        // not infer it from the absence of a line.
+        ui::info(&format!(
+            "  upstream signature: none — the {kind} commit is unsigned, so this \
+             bundle rests on the content chain plus its own signature"
+        ));
         return Ok(SignatureStatus::Unsigned {
             reason: format!("the {kind} commit carries no signature"),
         });

@@ -8,3 +8,6 @@
 *.key
 *.sec
 minisign.key
+
+# Release artifacts produced by `cargo xtask dist`.
+/dist/out

@@ -6,13 +6,9 @@ use crate::ui;
 use crate::KeygenArgs;
 
 pub fn run(args: KeygenArgs) -> Result<()> {
-    let public = amf_verify::generate_keypair(
-        &args.secret,
-        &args.public,
-        args.password,
-        &args.comment,
-    )
-    .with_context(|| format!("generating a keypair at {}", args.secret.display()))?;
+    let public =
+        amf_verify::generate_keypair(&args.secret, &args.public, args.password, &args.comment)
+            .with_context(|| format!("generating a keypair at {}", args.secret.display()))?;
 
     ui::step("signing keypair generated");
     ui::info(&format!("  secret key: {}", args.secret.display()));

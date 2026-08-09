@@ -9,11 +9,12 @@ pub mod download;
 pub mod git_http;
 pub mod hf;
 pub mod model;
+pub mod ms;
 pub mod pack;
 pub mod spec;
 pub mod variant;
 
-pub use model::{RemoteFile, Revision, Shard, Variant};
+pub use model::{RemoteFile, Revision, RevisionPrecision, Shard, Variant};
 pub use spec::{RepoId, RepoSpec, SourceKind};
 
 /// Re-exported so downstream crates share this crate's exact reqwest version
@@ -28,12 +29,18 @@ pub enum SourceError {
     #[error(
         "repository {repo} is not accessible{}",
         if *.authenticated {
-            " with the token supplied (it may not exist, or the token may lack access)"
+            " with the token supplied (it may not exist, or the token may lack access)".to_string()
         } else {
-            " (it may not exist, or it may be gated/private — try setting HF_TOKEN)"
+            format!(" (it may not exist, or it may be gated/private — try setting {token_env})")
         }
     )]
-    AccessDenied { repo: String, authenticated: bool },
+    AccessDenied {
+        repo: String,
+        authenticated: bool,
+        /// The env var that supplies a token *for this host* — telling a
+        /// ModelScope user to set HF_TOKEN is worse than saying nothing.
+        token_env: &'static str,
+    },
 
     #[error("repository {0} was not found")]
     NotFound(String),
@@ -82,16 +89,62 @@ impl SourceError {
     }
 }
 
+/// Where a host serves each kind of thing.
+///
+/// Evidence capture and downloading need URLs, and they used to build them from
+/// a hardcoded `huggingface.co`. Putting them here means a second host cannot be
+/// added without stating its endpoints, and a host that has no git endpoint at
+/// all says so structurally (`git_repo_url` returns `None`) rather than by
+/// failing at request time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEndpoints {
+    /// Base for the host's REST API.
+    pub api_base: String,
+    /// Base such that `{resolve_base}/{repo}/resolve/{commit}/{path}` serves bytes.
+    pub resolve_base: String,
+    /// Base for git smart-HTTP, or `None` where the host serves no git endpoint.
+    pub git_base: Option<String>,
+    /// Suffix a repo needs on the git path — hosts disagree about `.git`.
+    pub git_suffix: String,
+}
+
+impl HostEndpoints {
+    /// URL for a file's bytes at a pinned revision.
+    pub fn file_url(&self, repo: &str, commit: &str, path: &str) -> String {
+        download::file_url(&self.resolve_base, repo, commit, path)
+    }
+
+    /// Smart-HTTP base for one repository, if this host has one.
+    pub fn git_repo_url(&self, repo: &str) -> Option<String> {
+        self.git_base
+            .as_ref()
+            .map(|base| format!("{}/{}{}", base.trim_end_matches('/'), repo, self.git_suffix))
+    }
+}
+
 /// A place models can be fetched from.
 #[async_trait::async_trait]
 pub trait Source: Send + Sync {
     fn kind(&self) -> SourceKind;
+
+    /// Where this host serves its API, bytes, and git objects.
+    fn endpoints(&self) -> HostEndpoints;
 
     /// Resolve a spec's revision to an immutable commit SHA.
     async fn resolve(&self, spec: &RepoSpec) -> Result<Revision, SourceError>;
 
     /// List every file at a resolved revision.
     async fn list_files(&self, rev: &Revision) -> Result<Vec<RemoteFile>, SourceError>;
+
+    /// Fetch the LFS pointer *text* for a file — not the file's contents.
+    ///
+    /// Deliberately a trait method rather than another URL template: hosts do
+    /// not agree on how to serve it. HuggingFace has a `/raw/` path that returns
+    /// the pointer verbatim; ModelScope's `/raw/` is a web-app route and its
+    /// pointer arrives wrapped in a JSON envelope. The caller checks whatever
+    /// comes back against the blob id in the signed tree, so a host that
+    /// mangles the bytes fails loudly rather than quietly.
+    async fn fetch_pointer(&self, rev: &Revision, path: &str) -> Result<Vec<u8>, SourceError>;
 
     /// List the selectable model variants at a revision.
     async fn list_variants(&self, rev: &Revision) -> Result<Vec<Variant>, SourceError> {
@@ -121,8 +174,6 @@ pub fn http_client(user_agent: &str) -> Result<reqwest::Client, SourceError> {
 pub fn backend(kind: SourceKind, client: reqwest::Client) -> Result<Box<dyn Source>, SourceError> {
     match kind {
         SourceKind::HuggingFace => Ok(Box::new(hf::HuggingFace::new(client))),
-        SourceKind::ModelScope => Err(SourceError::Unsupported(
-            "the ModelScope backend is not wired up yet".into(),
-        )),
+        SourceKind::ModelScope => Ok(Box::new(ms::ModelScope::new(client))),
     }
 }

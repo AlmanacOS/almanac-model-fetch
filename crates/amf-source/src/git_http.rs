@@ -115,7 +115,10 @@ fn fetch_request_body(commit: &str) -> Vec<u8> {
 /// The response is pkt-line framed: a `shallow-info` section, a delimiter, a
 /// `packfile` header, then side-band frames — band 1 carries pack data, band 2
 /// progress chatter, band 3 a fatal server error.
-pub(crate) fn extract_pack(response: &[u8]) -> Result<Vec<u8>, SourceError> {
+/// Demultiplex a `git-upload-pack` response down to the raw packfile.
+///
+/// Public so integration tests can run it against real captured responses.
+pub fn extract_pack(response: &[u8]) -> Result<Vec<u8>, SourceError> {
     let frames = parse_pkt_lines(response)?;
     let mut pack = Vec::new();
     let mut in_packfile = false;
@@ -162,23 +165,141 @@ pub(crate) fn extract_pack(response: &[u8]) -> Result<Vec<u8>, SourceError> {
     Ok(pack)
 }
 
+/// The `User-Agent` sent on git-protocol requests.
+///
+/// ModelScope's edge rejects requests to `*.git/*` whose agent does not start
+/// with `git/` — a bare tool name gets HTTP 421 — so the prefix is load-bearing
+/// and must not be "tidied up". It is also accurate: on these requests this tool
+/// really is a git client speaking protocol v2, and the suffix says which one.
+/// REST requests keep the plain tool agent; only the git path claims to be git.
+pub fn git_user_agent() -> String {
+    format!(
+        "git/2.43.0 (almanac-model-fetch/{})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 /// Fetch the commit object and all reachable trees at `commit`.
+///
+/// `repo_url` is the full smart-HTTP base for one repository — hosts disagree
+/// about whether it ends in `.git`, so the caller supplies the whole thing
+/// rather than this module reassembling per-host knowledge it should not hold.
 ///
 /// Requires the server to support protocol v2 with `fetch` filters — verified
 /// against the capability advertisement first so an unsupported server produces
 /// a clear message rather than a confusing framing error.
 pub async fn fetch_commit_and_trees(
     client: &reqwest::Client,
-    endpoint: &str,
-    repo: &str,
+    repo_url: &str,
     commit: &str,
 ) -> Result<Vec<PackedObject>, SourceError> {
-    let base = format!("{}/{repo}", endpoint.trim_end_matches('/'));
+    let base = repo_url.trim_end_matches('/').to_string();
 
     // Step 1: capability advertisement.
+    let advert_bytes = advertise(client, &base).await?;
+    check_capabilities(&advert_bytes, "fetch", &["shallow", "filter"])?;
+
+    // Step 2: the fetch itself.
+    let body = post_command(&base, client, fetch_request_body(commit)).await?;
+
+    let pack = extract_pack(&body)?;
+    parse_pack(&pack)
+}
+
+/// Resolve refs to object ids over `ls-refs`.
+///
+/// This is how a host that publishes no branch→commit endpoint of its own
+/// (ModelScope) still names its head commit in full: the answer comes from the
+/// git server rather than from a REST field, and it is a complete 40-hex id
+/// rather than an abbreviation we would have to hedge about.
+pub async fn ls_refs(
+    client: &reqwest::Client,
+    repo_url: &str,
+    prefixes: &[String],
+) -> Result<Vec<RefEntry>, SourceError> {
+    let base = repo_url.trim_end_matches('/').to_string();
+    let advert_bytes = advertise(client, &base).await?;
+    check_capabilities(&advert_bytes, "ls-refs", &[])?;
+
+    let body = post_command(&base, client, ls_refs_request_body(prefixes)).await?;
+    parse_ls_refs(&body)
+}
+
+/// One line of an `ls-refs` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefEntry {
+    pub oid: String,
+    pub name: String,
+    /// For an annotated tag, the commit it ultimately points at.
+    pub peeled: Option<String>,
+}
+
+impl RefEntry {
+    /// The commit this ref designates: the peeled target for an annotated tag,
+    /// otherwise the ref's own object.
+    pub fn commit(&self) -> &str {
+        self.peeled.as_deref().unwrap_or(&self.oid)
+    }
+}
+
+pub(crate) fn ls_refs_request_body(prefixes: &[String]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line(b"command=ls-refs\n"));
+    body.extend_from_slice(&pkt_line(b"object-format=sha1\n"));
+    body.extend_from_slice(DELIM);
+    // `peel` so an annotated tag reports the commit it targets rather than the
+    // tag object, which is not something we could walk a tree from.
+    body.extend_from_slice(&pkt_line(b"peel\n"));
+    for prefix in prefixes {
+        body.extend_from_slice(&pkt_line(format!("ref-prefix {prefix}\n").as_bytes()));
+    }
+    body.extend_from_slice(FLUSH);
+    body
+}
+
+pub(crate) fn parse_ls_refs(response: &[u8]) -> Result<Vec<RefEntry>, SourceError> {
+    let frames = parse_pkt_lines(response)?;
+    let mut refs = Vec::new();
+    for frame in frames.iter().flatten() {
+        let line = String::from_utf8_lossy(frame);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ERR ") {
+            return Err(SourceError::Malformed(format!(
+                "git server refused ls-refs: {rest}"
+            )));
+        }
+        let mut parts = line.split(' ');
+        let (Some(oid), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !is_hex_oid(oid) {
+            continue;
+        }
+        let peeled = parts
+            .find_map(|attr| attr.strip_prefix("peeled:"))
+            .filter(|p| is_hex_oid(p))
+            .map(|p| p.to_string());
+        refs.push(RefEntry {
+            oid: oid.to_ascii_lowercase(),
+            name: name.to_string(),
+            peeled: peeled.map(|p| p.to_ascii_lowercase()),
+        });
+    }
+    Ok(refs)
+}
+
+fn is_hex_oid(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn advertise(client: &reqwest::Client, base: &str) -> Result<Vec<u8>, SourceError> {
     let refs_url = format!("{base}/info/refs?service=git-upload-pack");
     let advert = client
         .get(&refs_url)
+        .header("User-Agent", git_user_agent())
         .header("Git-Protocol", "version=2")
         .send()
         .await
@@ -189,37 +310,43 @@ pub async fn fetch_commit_and_trees(
             status: advert.status().as_u16(),
         });
     }
-    let advert_bytes = read_body_capped(advert, &refs_url, MAX_ADVERT_BYTES).await?;
-    check_capabilities(&advert_bytes)?;
+    read_body_capped(advert, &refs_url, MAX_ADVERT_BYTES).await
+}
 
-    // Step 2: the fetch itself.
-    let fetch_url = format!("{base}/git-upload-pack");
+async fn post_command(
+    base: &str,
+    client: &reqwest::Client,
+    body: Vec<u8>,
+) -> Result<Vec<u8>, SourceError> {
+    let url = format!("{base}/git-upload-pack");
     let response = client
-        .post(&fetch_url)
+        .post(&url)
+        .header("User-Agent", git_user_agent())
         .header("Git-Protocol", "version=2")
         .header("Content-Type", "application/x-git-upload-pack-request")
         .header("Accept", "application/x-git-upload-pack-result")
-        .body(fetch_request_body(commit))
+        .body(body)
         .send()
         .await
-        .map_err(|e| transport(&fetch_url, e))?;
+        .map_err(|e| transport(&url, e))?;
     if !response.status().is_success() {
         return Err(SourceError::Http {
-            url: fetch_url,
+            url,
             status: response.status().as_u16(),
         });
     }
-    let body = read_body_capped(response, &fetch_url, MAX_FETCH_RESPONSE_BYTES).await?;
-
-    let pack = extract_pack(&body)?;
-    parse_pack(&pack)
+    read_body_capped(response, &url, MAX_FETCH_RESPONSE_BYTES).await
 }
 
-/// Confirm the server speaks v2 and supports the fetch features we rely on.
-fn check_capabilities(advert: &[u8]) -> Result<(), SourceError> {
+/// Confirm the server speaks v2 and advertises the command and features we need.
+///
+/// `command` must appear in the advertisement at all; each of `features` must
+/// appear in that command's value (`fetch=shallow wait-for-done filter`).
+fn check_capabilities(advert: &[u8], command: &str, features: &[&str]) -> Result<(), SourceError> {
     let frames = parse_pkt_lines(advert)?;
     let mut version2 = false;
-    let mut fetch_caps = String::new();
+    let mut caps: Option<String> = None;
+    let prefix = format!("{command}=");
 
     for frame in frames.iter().flatten() {
         let line = String::from_utf8_lossy(frame);
@@ -227,8 +354,12 @@ fn check_capabilities(advert: &[u8]) -> Result<(), SourceError> {
         if line == "version 2" {
             version2 = true;
         }
-        if let Some(caps) = line.strip_prefix("fetch=") {
-            fetch_caps = caps.to_string();
+        // A command with no features advertises as a bare word (`server-option`)
+        // rather than `name=values`, so accept both spellings.
+        if line == command {
+            caps = Some(String::new());
+        } else if let Some(values) = line.strip_prefix(&prefix) {
+            caps = Some(values.to_string());
         }
     }
 
@@ -237,10 +368,15 @@ fn check_capabilities(advert: &[u8]) -> Result<(), SourceError> {
             "the git server does not speak protocol v2; evidence capture needs it".into(),
         ));
     }
-    for needed in ["shallow", "filter"] {
-        if !fetch_caps.split_whitespace().any(|c| c == needed) {
+    let Some(caps) = caps else {
+        return Err(SourceError::Unsupported(format!(
+            "the git server does not advertise the {command} command; evidence capture needs it"
+        )));
+    };
+    for needed in features {
+        if !caps.split_whitespace().any(|c| c == *needed) {
             return Err(SourceError::Unsupported(format!(
-                "the git server does not advertise fetch={needed}; evidence capture needs it"
+                "the git server does not advertise {command}={needed}; evidence capture needs it"
             )));
         }
     }
@@ -357,7 +493,8 @@ mod tests {
         advert.extend_from_slice(&pkt_line(b"server-option\n"));
         advert.extend_from_slice(&pkt_line(b"object-format=sha1\n"));
         advert.extend_from_slice(FLUSH);
-        assert!(check_capabilities(&advert).is_ok());
+        assert!(check_capabilities(&advert, "fetch", &["shallow", "filter"]).is_ok());
+        assert!(check_capabilities(&advert, "ls-refs", &[]).is_ok());
     }
 
     #[test]
@@ -367,8 +504,88 @@ mod tests {
         advert.extend_from_slice(FLUSH);
         advert.extend_from_slice(&pkt_line(b"abc123 HEAD\0multi_ack side-band-64k\n"));
         advert.extend_from_slice(FLUSH);
-        let err = check_capabilities(&advert).unwrap_err().to_string();
+        let err = check_capabilities(&advert, "fetch", &["shallow", "filter"])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("protocol v2"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_server_that_cannot_list_refs() {
+        let mut advert = Vec::new();
+        advert.extend_from_slice(&pkt_line(b"version 2\n"));
+        advert.extend_from_slice(&pkt_line(b"fetch=shallow filter\n"));
+        advert.extend_from_slice(FLUSH);
+        let err = check_capabilities(&advert, "ls-refs", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ls-refs"), "{err}");
+    }
+
+    #[test]
+    fn parses_an_ls_refs_response() {
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&pkt_line(
+            b"baaddd6fb19e702c1d54c5bb2a5746012c122619 HEAD symref-target:refs/heads/master\n",
+        ));
+        resp.extend_from_slice(&pkt_line(
+            b"baaddd6fb19e702c1d54c5bb2a5746012c122619 refs/heads/master\n",
+        ));
+        resp.extend_from_slice(&pkt_line(
+            b"1111111111111111111111111111111111111111 refs/tags/v1 \
+              peeled:2222222222222222222222222222222222222222\n",
+        ));
+        resp.extend_from_slice(FLUSH);
+
+        let refs = parse_ls_refs(&resp).unwrap();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[1].name, "refs/heads/master");
+        assert_eq!(refs[1].commit(), "baaddd6fb19e702c1d54c5bb2a5746012c122619");
+        // An annotated tag must report the commit it targets, not the tag object:
+        // the tag object is not something a tree walk can start from.
+        assert_eq!(refs[2].commit(), "2222222222222222222222222222222222222222");
+    }
+
+    #[test]
+    fn ls_refs_surfaces_a_server_error() {
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&pkt_line(b"ERR upload-pack: not our ref\n"));
+        resp.extend_from_slice(FLUSH);
+        let err = parse_ls_refs(&resp).unwrap_err().to_string();
+        assert!(err.contains("not our ref"), "{err}");
+    }
+
+    #[test]
+    fn ls_refs_ignores_lines_that_are_not_refs() {
+        // Never let a non-oid first token become something we might treat as a
+        // commit id downstream.
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&pkt_line(b"unborn HEAD symref-target:refs/heads/main\n"));
+        resp.extend_from_slice(&pkt_line(b"short refs/heads/x\n"));
+        resp.extend_from_slice(FLUSH);
+        assert!(parse_ls_refs(&resp).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ls_refs_body_is_well_formed() {
+        let body = ls_refs_request_body(&["refs/heads/master".to_string()]);
+        let frames = parse_pkt_lines(&body).unwrap();
+        let payloads: Vec<String> = frames
+            .iter()
+            .flatten()
+            .map(|f| String::from_utf8_lossy(f).trim().to_string())
+            .collect();
+        assert_eq!(payloads[0], "command=ls-refs");
+        assert!(payloads.contains(&"peel".to_string()));
+        assert!(payloads.contains(&"ref-prefix refs/heads/master".to_string()));
+    }
+
+    #[test]
+    fn the_git_user_agent_keeps_its_git_prefix() {
+        // ModelScope's edge returns 421 without it; this is a wire requirement,
+        // not cosmetics.
+        assert!(git_user_agent().starts_with("git/"), "{}", git_user_agent());
+        assert!(git_user_agent().contains("almanac-model-fetch"));
     }
 
     #[test]
@@ -377,7 +594,9 @@ mod tests {
         advert.extend_from_slice(&pkt_line(b"version 2\n"));
         advert.extend_from_slice(&pkt_line(b"fetch=shallow\n"));
         advert.extend_from_slice(FLUSH);
-        let err = check_capabilities(&advert).unwrap_err().to_string();
+        let err = check_capabilities(&advert, "fetch", &["shallow", "filter"])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("filter"), "{err}");
     }
 }

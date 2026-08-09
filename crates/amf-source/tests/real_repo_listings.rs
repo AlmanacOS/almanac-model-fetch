@@ -55,11 +55,7 @@ fn every_gguf_in_a_real_repo_has_a_verifiable_hash() {
     assert!(!ggufs.is_empty());
 
     for f in &ggufs {
-        assert!(
-            f.sha256.is_some(),
-            "{} has no published SHA256",
-            f.path
-        );
+        assert!(f.sha256.is_some(), "{} has no published SHA256", f.path);
         assert_eq!(
             f.sha256.as_ref().unwrap().len(),
             64,
@@ -92,7 +88,11 @@ fn groups_a_sharded_repo_into_whole_variants() {
         );
 
         // Shards must be contiguous and in load order.
-        let indices: Vec<u32> = v.files.iter().filter_map(|f| f.shard.map(|s| s.index)).collect();
+        let indices: Vec<u32> = v
+            .files
+            .iter()
+            .filter_map(|f| f.shard.map(|s| s.index))
+            .collect();
         let expected: Vec<u32> = (1..=indices.len() as u32).collect();
         assert_eq!(indices, expected, "variant {} shards out of order", v.label);
 

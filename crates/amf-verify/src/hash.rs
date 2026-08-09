@@ -243,10 +243,7 @@ mod tests {
 
         let mut v = resume_from_file(&path, HELLO, 11).unwrap();
         v.update(b"world").unwrap();
-        assert!(matches!(
-            v.finish(),
-            Err(VerifyError::HashMismatch { .. })
-        ));
+        assert!(matches!(v.finish(), Err(VerifyError::HashMismatch { .. })));
     }
 
     #[test]

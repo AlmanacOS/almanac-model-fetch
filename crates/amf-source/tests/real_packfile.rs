@@ -15,7 +15,10 @@ fn parses_the_real_hf_pack() {
     let objects = parse_pack(PACK).unwrap();
     assert_eq!(objects.len(), 2);
 
-    let commit = objects.iter().find(|o| o.kind == ObjectKind::Commit).unwrap();
+    let commit = objects
+        .iter()
+        .find(|o| o.kind == ObjectKind::Commit)
+        .unwrap();
     assert_eq!(commit.oid, "a6adef130ffb23ddaf1a62fec9dced968c9bc482");
 
     let tree = objects.iter().find(|o| o.kind == ObjectKind::Tree).unwrap();
@@ -25,7 +28,10 @@ fn parses_the_real_hf_pack() {
 #[test]
 fn the_packed_commit_is_the_signed_commit_we_know() {
     let objects = parse_pack(PACK).unwrap();
-    let commit = objects.iter().find(|o| o.kind == ObjectKind::Commit).unwrap();
+    let commit = objects
+        .iter()
+        .find(|o| o.kind == ObjectKind::Commit)
+        .unwrap();
 
     let parsed = amf_verify::git::parse_commit(&commit.data).unwrap();
     assert!(parsed.is_signed());

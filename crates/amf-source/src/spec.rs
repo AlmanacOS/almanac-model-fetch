@@ -111,7 +111,11 @@ impl RepoSpec {
             if value.is_empty() {
                 return Err(SourceError::BadSpec(format!(
                     "empty {} in spec {input:?}",
-                    if marker == b'@' { "revision" } else { "variant" }
+                    if marker == b'@' {
+                        "revision"
+                    } else {
+                        "variant"
+                    }
                 )));
             }
             match marker {
@@ -244,10 +248,7 @@ mod tests {
 
     #[test]
     fn source_kind_parses_short_and_long_names() {
-        assert_eq!(
-            "hf".parse::<SourceKind>().unwrap(),
-            SourceKind::HuggingFace
-        );
+        assert_eq!("hf".parse::<SourceKind>().unwrap(), SourceKind::HuggingFace);
         assert_eq!(
             "modelscope".parse::<SourceKind>().unwrap(),
             SourceKind::ModelScope

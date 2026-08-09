@@ -9,8 +9,9 @@ pub mod manifest;
 
 pub use layout::{bundle_dir_name, bundle_path, inspect_existing, BundleWriter, Existing};
 pub use manifest::{
-    compute_bundle_digest, C2paRecord, ContentHashStatus, Corroboration, FileEntry, Manifest,
-    SignatureStatus, SourceRecord, Tool, Verification, SCHEMA_VERSION,
+    compute_bundle_digest, ContentHashStatus, CorroboratedFile, Corroboration,
+    CorroborationConflict, EvidenceKind, FileEntry, Manifest, RevisionPrecision, SignatureStatus,
+    SourceRecord, Tool, Verification, SCHEMA_VERSION,
 };
 
 #[derive(Debug, thiserror::Error)]

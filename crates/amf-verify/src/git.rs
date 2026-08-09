@@ -247,10 +247,9 @@ pub fn parse_tree(raw: &[u8]) -> Result<Vec<TreeEntry>, VerifyError> {
         let mode = String::from_utf8_lossy(&raw[i..i + space]).into_owned();
         i += space + 1;
 
-        let nul = raw[i..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| VerifyError::MalformedObject("tree entry name is unterminated".into()))?;
+        let nul = raw[i..].iter().position(|&b| b == 0).ok_or_else(|| {
+            VerifyError::MalformedObject("tree entry name is unterminated".into())
+        })?;
         let name = String::from_utf8_lossy(&raw[i..i + nul]).into_owned();
         i += nul + 1;
 
@@ -340,7 +339,10 @@ mod tests {
         let payload = Commit::signed_payload(&raw);
         let text = String::from_utf8(payload).unwrap();
 
-        assert!(!text.contains("gpgsig"), "signature header must be stripped");
+        assert!(
+            !text.contains("gpgsig"),
+            "signature header must be stripped"
+        );
         assert!(!text.contains("BEGIN PGP"), "and its continuations too");
         assert!(text.contains("tree 116f6efc"));
         assert!(text.contains("parent 672575d5"));

@@ -159,7 +159,10 @@ mod tests {
 
     #[test]
     fn rejects_a_non_numeric_size() {
-        let p = format!("version {SPEC_V1}\noid sha256:{}\nsize huge\n", "a".repeat(64));
+        let p = format!(
+            "version {SPEC_V1}\noid sha256:{}\nsize huge\n",
+            "a".repeat(64)
+        );
         assert!(parse_pointer(p.as_bytes()).is_err());
     }
 }

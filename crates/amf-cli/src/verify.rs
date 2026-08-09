@@ -56,7 +56,10 @@ pub fn run(args: VerifyArgs) -> Result<()> {
     }
 
     if failed > 0 {
-        bail!("{failed} of {} bundle(s) failed verification", bundles.len());
+        bail!(
+            "{failed} of {} bundle(s) failed verification",
+            bundles.len()
+        );
     }
     ui::info(&format!("{} bundle(s) verified", bundles.len()));
     Ok(())
@@ -72,16 +75,20 @@ fn verify_one(
     let manifest_path = bundle.join(layout::MANIFEST_FILE);
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let manifest = Manifest::from_json(&manifest_bytes)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    // Schema-checked: a manifest from another schema fails on whichever field
+    // moved, and "missing field `evidence`" tells an operator nothing about
+    // what to do next.
+    let manifest = Manifest::from_json_checked(&manifest_bytes)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
 
     // 1. Every model file must hash to what the manifest says.
     let model_dir = bundle.join(layout::MODEL_DIR);
     for entry in &manifest.files {
         ensure_inside_bundle(&entry.path)?;
         let path = model_dir.join(&entry.path);
-        let actual = amf_verify::hash_file(&path)
-            .map_err(|e| anyhow!("hashing {}: {e}", path.display()))?;
+        let actual =
+            amf_verify::hash_file(&path).map_err(|e| anyhow!("hashing {}: {e}", path.display()))?;
         if !actual.eq_ignore_ascii_case(&entry.sha256) {
             bail!(
                 "{} does not match the manifest (expected {}, got {actual})",
@@ -90,7 +97,10 @@ fn verify_one(
             );
         }
     }
-    ui::info(&format!("  {} file(s) match the manifest", manifest.files.len()));
+    ui::info(&format!(
+        "  {} file(s) match the manifest",
+        manifest.files.len()
+    ));
 
     // 2. The manifest's own digest must match the files it lists — otherwise a
     //    file could be added or removed without the per-file checks noticing.
@@ -215,11 +225,81 @@ fn verify_one(
              pinned one. Treat this artifact as suspect.",
         );
     }
-    if let amf_bundle::Corroboration::Mismatch { host, ours, theirs } = &manifest.corroboration {
-        ui::alarm(
-            "CROSS-SOURCE HASH DISAGREEMENT RECORDED",
-            &format!("{host} published {theirs} but this bundle holds {ours}."),
+    if let amf_bundle::SignatureStatus::Unknown { reason } =
+        &manifest.verification.upstream_signature
+    {
+        // Not an alarm — nothing here is wrong — but the airgapped operator
+        // should not have to infer from silence that Tier 2 was never reached.
+        ui::warn(&format!(
+            "Tier 2 was never established for this bundle: {reason}. Nothing is \
+             claimed about the upstream commit signature either way."
+        ));
+    }
+    match &manifest.corroboration {
+        amf_bundle::Corroboration::Mismatch {
+            host,
+            repo,
+            conflicts,
+            ..
+        } => {
+            let detail = conflicts
+                .iter()
+                .map(|c| {
+                    format!(
+                        "    {}\n      here:  {}\n      {host}: {}",
+                        c.path, c.ours, c.theirs
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            ui::alarm(
+                "CROSS-SOURCE HASH DISAGREEMENT RECORDED",
+                &format!(
+                    "When this bundle was fetched, {host}/{repo} published different \
+                     bytes for {} file(s):\n{detail}",
+                    conflicts.len()
+                ),
+            );
+        }
+        amf_bundle::Corroboration::Match { host, files, .. } => {
+            ui::info(&format!(
+                "corroboration recorded: {host} published the same hash for {} file(s)",
+                files.len()
+            ));
+        }
+        amf_bundle::Corroboration::Unavailable { .. } | amf_bundle::Corroboration::Skipped => {}
+    }
+
+    // Say plainly what this bundle's Tier 1 actually rests on.
+    if !manifest.verification.evidence.is_rederivable() {
+        ui::warn(
+            "this bundle carries no re-derivable evidence chain: its file hashes were \
+             taken from the host's API over TLS rather than from a signed git tree. \
+             The contents match what the manifest records, and the bundle signature \
+             (if any) covers that record — but nothing here independently ties those \
+             hashes to the upstream repository.",
         );
+    }
+
+    // The precision field is redundant with the commit id's own length, on
+    // purpose: a manifest that claims exactness for a short id is lying about
+    // the one field an auditor would most want to trust.
+    let claimed = manifest.source.revision_precision;
+    let actual = amf_bundle::RevisionPrecision::of(&manifest.source.commit);
+    if claimed != actual {
+        bail!(
+            "manifest claims revision precision {claimed:?} but the recorded commit \
+             {} is {actual:?}",
+            manifest.source.commit
+        );
+    }
+    if actual == amf_bundle::RevisionPrecision::Abbreviated {
+        ui::warn(&format!(
+            "this bundle records an abbreviated revision ({}); the host could not name \
+             its head commit in full, so the revision is a prefix rather than an \
+             immutable id.",
+            manifest.source.commit
+        ));
     }
 
     Ok(())

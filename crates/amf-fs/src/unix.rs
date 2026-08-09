@@ -182,7 +182,9 @@ fn kind_from_name(name: &str, source: Option<&str>) -> FsKind {
     if lower.contains("ntfs") {
         return FsKind::Ntfs;
     }
-    FsKind::Other { name: name.to_string() }
+    FsKind::Other {
+        name: name.to_string(),
+    }
 }
 
 /// Determine which FAT variant, best-effort, from the backing device.

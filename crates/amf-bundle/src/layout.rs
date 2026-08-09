@@ -11,7 +11,6 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SIGNATURE_FILE: &str = "manifest.json.minisig";
 pub const MODEL_DIR: &str = "model";
 pub const EVIDENCE_DIR: &str = "evidence";
-pub const C2PA_FILE: &str = "provenance.c2pa";
 /// In-progress bundles land here and are renamed into place only when complete,
 /// so a bundle directory never exists in a half-written state.
 pub const PARTIAL_SUFFIX: &str = ".partial";

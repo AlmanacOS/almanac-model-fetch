@@ -1,7 +1,7 @@
 //! The trust store: pinned upstream signing keys, and — separately — the
 //! history of issuer fingerprints we have merely *observed*.
 //!
-//! The separation is the point (PLAN.md §2). A pinned key enables real
+//! The separation is the point (ARCHITECTURE.md §3). A pinned key enables real
 //! cryptographic verification and is added only by explicit operator action
 //! (`amf trust add`). Observed fingerprints accumulate automatically and prove
 //! nothing; they exist so that a *change* in the claimed signer — which is
@@ -208,7 +208,10 @@ mod tests {
     #[test]
     fn first_observation_then_consistent() {
         let mut s = TrustStore::default();
-        assert_eq!(s.record_observation("huggingface", "AAAA"), Observation::First);
+        assert_eq!(
+            s.record_observation("huggingface", "AAAA"),
+            Observation::First
+        );
         assert_eq!(
             s.record_observation("huggingface", "AAAA"),
             Observation::Consistent
@@ -249,7 +252,10 @@ mod tests {
     fn hosts_do_not_share_observations() {
         let mut s = TrustStore::default();
         s.record_observation("huggingface", "AAAA");
-        assert_eq!(s.record_observation("modelscope", "AAAA"), Observation::First);
+        assert_eq!(
+            s.record_observation("modelscope", "AAAA"),
+            Observation::First
+        );
     }
 
     #[test]

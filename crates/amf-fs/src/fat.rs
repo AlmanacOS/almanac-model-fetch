@@ -89,7 +89,11 @@ pub fn classify_boot_sector(sector: &[u8]) -> FatVariant {
         return classify_by_label(sector);
     }
 
-    let fat_size = if fat_size_16 != 0 { fat_size_16 } else { fat_size_32 };
+    let fat_size = if fat_size_16 != 0 {
+        fat_size_16
+    } else {
+        fat_size_32
+    };
     let total_sectors = if total_sectors_16 != 0 {
         total_sectors_16
     } else {
@@ -173,7 +177,17 @@ mod tests {
     fn identifies_fat32_by_cluster_count() {
         // 8 GB volume, 8 sectors/cluster -> well over 65525 clusters.
         let s = bpb(
-            512, 8, 32, 2, 0, 0, 0, 16_777_216, 16_384, b"        ", b"FAT32   ",
+            512,
+            8,
+            32,
+            2,
+            0,
+            0,
+            0,
+            16_777_216,
+            16_384,
+            b"        ",
+            b"FAT32   ",
         );
         assert_eq!(classify_boot_sector(&s), FatVariant::Fat32);
     }
@@ -181,7 +195,19 @@ mod tests {
     #[test]
     fn identifies_fat16_by_cluster_count() {
         // ~64 MB volume, 4 sectors/cluster -> between 4085 and 65525 clusters.
-        let s = bpb(512, 4, 1, 2, 512, 0, 128, 131_072, 0, b"FAT16   ", b"        ");
+        let s = bpb(
+            512,
+            4,
+            1,
+            2,
+            512,
+            0,
+            128,
+            131_072,
+            0,
+            b"FAT16   ",
+            b"        ",
+        );
         assert_eq!(classify_boot_sector(&s), FatVariant::Fat16);
     }
 
@@ -196,7 +222,19 @@ mod tests {
     fn cluster_count_beats_a_lying_label() {
         // The spec says the label string is not authoritative. A FAT16-geometry
         // volume mislabelled FAT32 must still come back FAT16.
-        let s = bpb(512, 4, 1, 2, 512, 0, 128, 131_072, 0, b"        ", b"FAT32   ");
+        let s = bpb(
+            512,
+            4,
+            1,
+            2,
+            512,
+            0,
+            128,
+            131_072,
+            0,
+            b"        ",
+            b"FAT32   ",
+        );
         assert_eq!(classify_boot_sector(&s), FatVariant::Fat16);
     }
 

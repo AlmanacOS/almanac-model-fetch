@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod corroborate;
 mod fetch;
 mod keys;
 mod list;
@@ -101,6 +102,16 @@ pub struct FetchArgs {
     /// Skip cross-checking the file hash against the other host.
     #[arg(long)]
     pub no_corroborate: bool,
+
+    /// Corroborate against a specific repo: `<host>:<org/name>`.
+    ///
+    /// Mirrors are not always named identically; this points at the real one.
+    #[arg(long, value_name = "HOST:REPO", conflicts_with = "no_corroborate")]
+    pub corroborate_with: Option<String>,
+
+    /// Refuse to write a bundle unless the other host confirms the hashes.
+    #[arg(long, conflicts_with = "no_corroborate")]
+    pub require_corroboration: bool,
 
     /// Secret key used to sign the bundle manifest.
     #[arg(long, value_name = "PATH")]

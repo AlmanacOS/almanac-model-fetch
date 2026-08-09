@@ -1,7 +1,7 @@
 //! Tier 2 — OpenPGP handling for upstream commit signatures.
 //!
 //! Two operations, kept deliberately distinct because they carry very
-//! different weight (see PLAN.md §2):
+//! different weight (see ARCHITECTURE.md §3):
 //!
 //! - [`issuer_fingerprint`] reads which key a signature *claims* to come from.
 //!   That claim lives inside attacker-suppliable bytes; comparing it to a
@@ -75,9 +75,10 @@ pub fn verify_commit_signature(
     armored_pubkey: &str,
 ) -> Result<PgpVerified, VerifyError> {
     let commit = crate::git::parse_commit(raw_commit)?;
-    let armored_sig = commit.gpgsig.as_deref().ok_or_else(|| {
-        VerifyError::Signing("commit carries no gpgsig to verify".into())
-    })?;
+    let armored_sig = commit
+        .gpgsig
+        .as_deref()
+        .ok_or_else(|| VerifyError::Signing("commit carries no gpgsig to verify".into()))?;
 
     let (sig, _) = StandaloneSignature::from_string(armored_sig)
         .map_err(|e| VerifyError::Signing(format!("could not parse the PGP signature: {e}")))?;
@@ -119,9 +120,9 @@ mod tests {
     use pgp::composed::{KeyType, SecretKeyParamsBuilder};
     use pgp::crypto::hash::HashAlgorithm;
     use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
-    use pgp::types::{PublicKeyTrait, SecretKeyTrait};
     #[allow(unused_imports)]
     use pgp::types::KeyId;
+    use pgp::types::{PublicKeyTrait, SecretKeyTrait};
 
     /// The real signed commit captured from unsloth/Qwen3-8B-GGUF.
     const REAL_COMMIT: &[u8] = include_bytes!("../tests/fixtures/commit_signed.raw");
@@ -159,10 +160,7 @@ mod tests {
         secret.sign(rand::thread_rng(), String::new).unwrap()
     }
 
-    fn sign_commit_payload(
-        key: &pgp::composed::SignedSecretKey,
-        payload: &[u8],
-    ) -> String {
+    fn sign_commit_payload(key: &pgp::composed::SignedSecretKey, payload: &[u8]) -> String {
         let mut config = SignatureConfig::v4(
             SignatureType::Binary,
             key.algorithm(),
@@ -175,9 +173,7 @@ mod tests {
             Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())),
             Subpacket::regular(SubpacketData::Issuer(key.key_id())),
         ];
-        let sig = config
-            .sign(key, String::new, payload)
-            .unwrap();
+        let sig = config.sign(key, String::new, payload).unwrap();
         StandaloneSignature::new(sig)
             .to_armored_string(Default::default())
             .unwrap()
@@ -234,7 +230,9 @@ mod tests {
             .unwrap();
 
         let commit = signed_commit(&key, "original");
-        let tampered = String::from_utf8(commit).unwrap().replace("original", "evilware");
+        let tampered = String::from_utf8(commit)
+            .unwrap()
+            .replace("original", "evilware");
         let err = verify_commit_signature(tampered.as_bytes(), &pubkey).unwrap_err();
         assert!(matches!(err, VerifyError::BadSignature));
     }
@@ -260,7 +258,9 @@ mod tests {
     #[test]
     fn an_unsigned_commit_cannot_be_verified() {
         let raw = b"tree abc\ncommitter A <a@x> 1 +0000\n\nmsg\n";
-        let err = verify_commit_signature(raw, "whatever").unwrap_err().to_string();
+        let err = verify_commit_signature(raw, "whatever")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no gpgsig"), "{err}");
     }
 

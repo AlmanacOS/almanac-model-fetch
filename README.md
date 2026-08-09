@@ -5,7 +5,7 @@ upstream-published hashes as it streams, captures what provenance exists, signs
 the result, and writes a self-contained bundle a USB drive can carry to an
 airgapped machine that has no network at all.
 
-See [PLAN.md](PLAN.md) for the design and the trust model.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the trust model.
 
 ## Usage
 
@@ -16,6 +16,12 @@ amf keygen --secret amf.key --public amf.pub
 # Fetch. Multiple models per run; each is bundled separately.
 amf fetch unsloth/Llama-3.2-1B-Instruct-GGUF:Q4_K_M --usb /mnt/usb --key amf.key
 amf fetch unsloth/Qwen3-8B-GGUF:UD-Q4_K_XL unsloth/DeepSeek-R1-GGUF:UD-IQ1_S \
+    --usb /mnt/usb --key amf.key
+
+# From a network that cannot reach HuggingFace (mainland China, typically).
+# Never automatic: switching hosts changes what the bundle can prove, so it is
+# always the operator's decision.
+amf fetch unsloth/Qwen3-8B-GGUF:UD-Q4_K_XL --source modelscope \
     --usb /mnt/usb --key amf.key
 
 # On the airgapped machine — no network, no keyserver, no clock needed.
@@ -32,7 +38,26 @@ amf verify /mnt/usb --public-key amf.pub --upstream-key hf-signing-key.asc
 Repo specs are `org/name[@revision][:variant]`. Omit the variant to get an
 interactive picker; pass `--variant` for scripts. A revision always resolves to
 an immutable commit SHA before anything is fetched, and the bundle records that
-SHA rather than the branch name.
+SHA rather than the branch name. If a host cannot name its head commit in full,
+the bundle records the abbreviated id *as* abbreviated and says so — it never
+presents a prefix as an immutable revision.
+
+## Cross-source corroboration
+
+Every fetch asks the *other* host whether it publishes the same SHA-256, before
+downloading anything. Two independent hosts agreeing is cheap, real evidence.
+
+```bash
+amf fetch … --no-corroborate                              # skip the check
+amf fetch … --corroborate-with modelscope:Org/Mirror-Name # non-identical mirror
+amf fetch … --require-corroboration                       # refuse without it
+```
+
+A miss is silent — an operator who chose ModelScope because HuggingFace is
+blocked cannot be expected to reach it, and warning every time would be noise. A
+*disagreement* is loud, and recorded in the manifest, but does not by itself
+abort: two hosts can legitimately differ after a re-quantisation, unlike a
+single host contradicting its own signed tree, which always aborts.
 
 ## Bundle layout
 
@@ -46,7 +71,7 @@ SHA rather than the branch name.
     ├── commit.obj              the GPG-signed commit, byte-for-byte
     ├── commit.sig.asc          its signature, extracted
     ├── tree/<oid>.obj          tree objects on the path to each file
-    └── lfs/<name>.pointer      the LFS pointers naming each SHA256
+    └── lfs/<oid>.pointer       the LFS pointers naming each SHA256
 ```
 
 The directory name is content-addressed, so re-fetching the same variant at the
@@ -106,14 +131,51 @@ Also working, since the Tier-2 milestone:
 - **Offline chain re-derivation** in `amf verify`, plus `--upstream-key` to
   check the captured commit signature airgapped.
 
-Not yet implemented — the manifest reports these accurately rather than
-pretending otherwise:
+And since the ModelScope milestone:
 
-- **ModelScope backend** and cross-source corroboration.
-- **C2PA detection** beyond the sidecar case.
-- **Cross-compilation** via cargo-zigbuild.
+- **ModelScope**, at full parity: same trait, same evidence capture over git,
+  same bundle layout. It publishes a SHA-256 for *every* file — even the small
+  ones HuggingFace leaves unhashed — so its Tier-1 coverage is broader. Its
+  commits are unsigned, and the manifest records that rather than glossing it.
+- **Cross-source corroboration**, on by default and never blocking.
+- **`cargo xtask dist`** for reproducible cross-compiled release artifacts with
+  a signed `SHA256SUMS`.
+
+Known limits, stated rather than buried:
+
 - **HF's signing key remains unpublished**, so Tier 2 on a fresh install is
   observation-only until you obtain and pin the key out of band.
+- **ModelScope's LFS CDN was unreachable from the development machine**, so its
+  download path is the one part of that backend not exercised end-to-end here.
+  Everything up to the bytes is covered by live tests.
+- **macOS artifacts are built but never executed** by the Linux release job;
+  only a macOS runner can smoke-test them.
+
+C2PA is **out of scope**: no repo checked ships a C2PA manifest in any form —
+not as a sidecar, not in GGUF metadata — so the tool does not claim to look for
+one. See ARCHITECTURE.md §1.
+
+## Releases
+
+```bash
+cargo xtask image                      # build the pinned toolchain container
+cargo xtask dist --verify-reproducible # musl + windows, built twice and diffed
+cargo xtask dist --sign release.key    # emits SHA256SUMS + SHA256SUMS.minisig
+```
+
+Apple targets need `--sdkroot <path>` pointing at your own macOS SDK; none is
+vendored here, because Apple licenses it for use on Apple hardware. The release
+key is deliberately **separate from any bundle-signing key** — different
+lifetime, different blast radius — and its public half belongs in the repository
+so that a first-time downloader can check a binary without already having one.
+
+`SHA256SUMS` is in coreutils format, so `sha256sum -c SHA256SUMS` works for
+anyone who would rather not take this tool's word for the checking either, and
+`SHA256SUMS.minisig` is standard minisign, verifiable with the `minisign` CLI.
+
+What has actually been run: the musl artifact was built and verified static.
+The container image and the aarch64/Windows targets are **written but not yet
+exercised** — see ARCHITECTURE.md §14 for exactly what was and was not proven.
 
 ## Tests
 

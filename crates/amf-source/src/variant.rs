@@ -111,7 +111,10 @@ fn label_for(key: &str, prefix_len: usize) -> String {
         // Single-variant repo, or the prefix would eat the whole name: fall back
         // to the last token, which is the quant label in every naming scheme
         // seen in the wild.
-        return tokens.last().map(|s| s.to_string()).unwrap_or_else(|| key.to_string());
+        return tokens
+            .last()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| key.to_string());
     }
     tokens[prefix_len..].join("-")
 }
@@ -174,9 +177,18 @@ mod tests {
     #[test]
     fn groups_a_directory_of_shards_into_one_variant() {
         let files = vec![
-            f("DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00001-of-00003.gguf", 10),
-            f("DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00003-of-00003.gguf", 30),
-            f("DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00002-of-00003.gguf", 20),
+            f(
+                "DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00001-of-00003.gguf",
+                10,
+            ),
+            f(
+                "DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00003-of-00003.gguf",
+                30,
+            ),
+            f(
+                "DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00002-of-00003.gguf",
+                20,
+            ),
             f("DeepSeek-R1-BF16/DeepSeek-R1-BF16-00001-of-00001.gguf", 5),
         ];
         let variants = group(&files);

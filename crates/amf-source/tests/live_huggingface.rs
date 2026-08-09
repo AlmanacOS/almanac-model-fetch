@@ -8,7 +8,7 @@
 //! cargo test -p amf-source --test live_huggingface -- --ignored
 //! ```
 
-use amf_source::{http_client, hf::HuggingFace, RepoSpec, Source, SourceKind};
+use amf_source::{hf::HuggingFace, http_client, RepoSpec, Source, SourceKind};
 
 fn backend() -> HuggingFace {
     HuggingFace::new(http_client("almanac-model-fetch/0.1.0 (test)").unwrap())
@@ -34,10 +34,8 @@ async fn resolves_main_to_an_immutable_commit() {
 #[tokio::test]
 #[ignore = "requires network access to huggingface.co"]
 async fn a_pinned_revision_resolves_to_itself() {
-    let spec = RepoSpec::parse(
-        "unsloth/Qwen3-8B-GGUF@a6adef130ffb23ddaf1a62fec9dced968c9bc482",
-    )
-    .unwrap();
+    let spec =
+        RepoSpec::parse("unsloth/Qwen3-8B-GGUF@a6adef130ffb23ddaf1a62fec9dced968c9bc482").unwrap();
     let rev = backend().resolve(&spec).await.unwrap();
     assert_eq!(rev.commit, "a6adef130ffb23ddaf1a62fec9dced968c9bc482");
 }
@@ -135,11 +133,10 @@ async fn resumes_a_partial_download_over_the_network() {
     f.set_len(keep).unwrap();
     drop(f);
 
-    let got = amf_source::download::download_verified(
-        &client, &url, &dest, SMALL_SHA, SMALL_SIZE, None,
-    )
-    .await
-    .unwrap();
+    let got =
+        amf_source::download::download_verified(&client, &url, &dest, SMALL_SHA, SMALL_SIZE, None)
+            .await
+            .unwrap();
 
     assert!(got.resumed, "should have resumed rather than restarted");
     assert_eq!(got.sha256, SMALL_SHA);
@@ -176,20 +173,27 @@ async fn a_wrong_expected_hash_is_rejected() {
 #[ignore = "requires network access to huggingface.co"]
 async fn fetches_the_signed_commit_and_trees_over_smart_http() {
     let client = http_client("almanac-model-fetch/0.1.0 (test)").unwrap();
+    let repo_url = format!("{}/unsloth/Qwen3-8B-GGUF", amf_source::hf::DEFAULT_ENDPOINT);
     let objects = amf_source::git_http::fetch_commit_and_trees(
         &client,
-        amf_source::hf::DEFAULT_ENDPOINT,
-        "unsloth/Qwen3-8B-GGUF",
+        &repo_url,
         "a6adef130ffb23ddaf1a62fec9dced968c9bc482",
     )
     .await
     .unwrap();
 
     use amf_verify::git::ObjectKind;
-    let commit = objects.iter().find(|o| o.kind == ObjectKind::Commit).unwrap();
+    let commit = objects
+        .iter()
+        .find(|o| o.kind == ObjectKind::Commit)
+        .unwrap();
     assert_eq!(commit.oid, "a6adef130ffb23ddaf1a62fec9dced968c9bc482");
     let parsed = amf_verify::git::parse_commit(&commit.data).unwrap();
     assert!(parsed.is_signed());
-    assert!(objects.iter().any(|o| o.kind == ObjectKind::Tree
-        && o.oid == "116f6efcc6377fce0d8d0917bc15c3126dcec5b9"));
+    assert!(
+        objects
+            .iter()
+            .any(|o| o.kind == ObjectKind::Tree
+                && o.oid == "116f6efcc6377fce0d8d0917bc15c3126dcec5b9")
+    );
 }

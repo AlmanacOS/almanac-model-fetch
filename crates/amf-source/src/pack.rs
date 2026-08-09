@@ -212,7 +212,11 @@ fn inflate(input: &[u8], expected_size: u64) -> Result<(Vec<u8>, usize), SourceE
     loop {
         let before_in = decomp.total_in();
         let status = decomp
-            .decompress_vec(&input[decomp.total_in() as usize..], &mut out, FlushDecompress::None)
+            .decompress_vec(
+                &input[decomp.total_in() as usize..],
+                &mut out,
+                FlushDecompress::None,
+            )
             .map_err(|e| malformed(&format!("zlib error in pack object: {e}")))?;
         match status {
             Status::StreamEnd => break,
@@ -459,7 +463,11 @@ mod tests {
         let objects = parse_pack(&pack).unwrap();
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[1].data, b"hello world");
-        assert_eq!(objects[1].kind, ObjectKind::Blob, "delta inherits base type");
+        assert_eq!(
+            objects[1].kind,
+            ObjectKind::Blob,
+            "delta inherits base type"
+        );
         assert_eq!(
             objects[1].oid,
             amf_verify::git::object_id(ObjectKind::Blob, b"hello world")

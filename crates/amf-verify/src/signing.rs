@@ -192,7 +192,11 @@ fn parse_public_key(input: &str) -> Result<minisign::PublicKey, VerifyError> {
         }
     }
     // A key file's last non-empty line is the key itself.
-    let candidate = trimmed.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(trimmed);
+    let candidate = trimmed
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(trimmed);
     minisign::PublicKey::from_base64(candidate.trim())
         .map_err(|e| VerifyError::Signing(format!("malformed public key: {e}")))
 }
@@ -321,7 +325,13 @@ mod tests {
     fn an_encrypted_key_needs_its_password() {
         let dir = tempfile::tempdir().unwrap();
         let sk = dir.path().join("enc.key");
-        generate_keypair(&sk, &dir.path().join("enc.pub"), Some("hunter2".into()), "enc").unwrap();
+        generate_keypair(
+            &sk,
+            &dir.path().join("enc.pub"),
+            Some("hunter2".into()),
+            "enc",
+        )
+        .unwrap();
 
         assert!(
             sign_bytes(&sk, None, b"data", "c").is_err(),

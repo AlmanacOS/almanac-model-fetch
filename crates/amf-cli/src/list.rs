@@ -21,7 +21,7 @@ pub fn run(args: ListArgs) -> Result<()> {
             let Ok(bytes) = std::fs::read(&manifest_path) else {
                 continue;
             };
-            match Manifest::from_json(&bytes) {
+            match Manifest::from_json_checked(&bytes) {
                 Ok(m) => rows.push(m),
                 // A directory that looks like a bundle but has an unreadable
                 // manifest is worth mentioning rather than silently hiding.
@@ -53,6 +53,10 @@ pub fn run(args: ListArgs) -> Result<()> {
             "    upstream signature: {}",
             describe_signature(&m.verification.upstream_signature)
         ));
+        ui::info(&format!(
+            "    evidence: {}",
+            describe_evidence(m.verification.evidence)
+        ));
         ui::info("");
     }
     Ok(())
@@ -63,10 +67,19 @@ fn describe_signature(status: &amf_bundle::SignatureStatus) -> String {
     use amf_bundle::SignatureStatus as S;
     match status {
         S::Verified { fingerprint } => format!("verified against {fingerprint}"),
-        S::SignaturePresentKeyUnpinned { .. } => {
-            "present, but not checked (no pinned key)".into()
-        }
+        S::SignaturePresentKeyUnpinned { .. } => "present, but not checked (no pinned key)".into(),
         S::SignaturePresentKeyMismatch { .. } => "MISMATCH — treat as suspect".into(),
         S::Unsigned { reason } => format!("none ({reason})"),
+        S::Unknown { reason } => format!("not established ({reason})"),
+    }
+}
+
+/// Describe what a bundle can prove on its own.
+fn describe_evidence(kind: amf_bundle::EvidenceKind) -> &'static str {
+    use amf_bundle::EvidenceKind as E;
+    match kind {
+        E::Chain => "signed commit chain — hashes re-derivable offline",
+        E::RestOnly => "API responses only — hashes are the host's word over TLS",
+        E::Absent => "none captured",
     }
 }

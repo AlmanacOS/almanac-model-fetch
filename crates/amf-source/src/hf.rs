@@ -1,8 +1,8 @@
 //! HuggingFace backend — the default source.
 
-use crate::model::{RemoteFile, Revision};
+use crate::model::{RemoteFile, Revision, RevisionPrecision};
 use crate::spec::{RepoId, RepoSpec, SourceKind};
-use crate::{Source, SourceError};
+use crate::{HostEndpoints, Source, SourceError};
 
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
@@ -48,7 +48,41 @@ impl HuggingFace {
         }
     }
 
-    async fn get_text(&self, url: &str, repo: &RepoId) -> Result<(String, Option<String>), SourceError> {
+    /// Translate a response status into the error it deserves, if any.
+    fn status_error(
+        &self,
+        status: reqwest::StatusCode,
+        url: &str,
+        repo: &RepoId,
+    ) -> Option<SourceError> {
+        // HuggingFace answers 401 for repos that do not exist as well as for
+        // ones you cannot see, deliberately refusing to confirm existence. We
+        // must not translate that into "no such repo" — the operator may simply
+        // need a token.
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Some(SourceError::AccessDenied {
+                repo: repo.to_string(),
+                authenticated: self.token.is_some(),
+                token_env: "HF_TOKEN",
+            });
+        }
+        if status.as_u16() == 404 {
+            return Some(SourceError::NotFound(repo.to_string()));
+        }
+        if !status.is_success() {
+            return Some(SourceError::Http {
+                url: url.to_string(),
+                status: status.as_u16(),
+            });
+        }
+        None
+    }
+
+    async fn get_text(
+        &self,
+        url: &str,
+        repo: &RepoId,
+    ) -> Result<(String, Option<String>), SourceError> {
         let resp = self
             .request(url)
             .send()
@@ -58,33 +92,34 @@ impl HuggingFace {
                 source: e,
             })?;
 
-        let status = resp.status();
-        // HuggingFace answers 401 for repos that do not exist as well as for
-        // ones you cannot see, deliberately refusing to confirm existence. We
-        // must not translate that into "no such repo" — the operator may simply
-        // need a token.
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(SourceError::AccessDenied {
-                repo: repo.to_string(),
-                authenticated: self.token.is_some(),
-            });
-        }
-        if status.as_u16() == 404 {
-            return Err(SourceError::NotFound(repo.to_string()));
-        }
-        if !status.is_success() {
-            return Err(SourceError::Http {
-                url: url.to_string(),
-                status: status.as_u16(),
-            });
+        if let Some(e) = self.status_error(resp.status(), url, repo) {
+            return Err(e);
         }
 
         let next = next_page_url(&resp, &self.endpoint);
-        let body = resp.text().await.map_err(|e| SourceError::Transport {
-            host: SourceKind::HuggingFace.host().into(),
-            source: e,
-        })?;
-        Ok((body, next))
+        let body = crate::git_http::read_body_capped(resp, url, MAX_API_RESPONSE_BYTES).await?;
+        Ok((String::from_utf8_lossy(&body).into_owned(), next))
+    }
+
+    /// Fetch a response body that must be small, refusing anything larger.
+    async fn get_capped(
+        &self,
+        url: &str,
+        repo: &RepoId,
+        cap: usize,
+    ) -> Result<Vec<u8>, SourceError> {
+        let resp = self
+            .request(url)
+            .send()
+            .await
+            .map_err(|e| SourceError::Transport {
+                host: SourceKind::HuggingFace.host().into(),
+                source: e,
+            })?;
+        if let Some(e) = self.status_error(resp.status(), url, repo) {
+            return Err(e);
+        }
+        crate::git_http::read_body_capped(resp, url, cap).await
     }
 }
 
@@ -128,10 +163,8 @@ pub(crate) fn parse_link_next(header: &str, endpoint: &str) -> Option<String> {
 ///
 /// Public so integration tests can run it against real captured responses.
 pub fn parse_tree_page(body: &str) -> Result<Vec<RemoteFile>, SourceError> {
-    let entries: Vec<serde_json::Value> =
-        serde_json::from_str(body).map_err(|e| SourceError::Malformed(format!(
-            "tree listing was not a JSON array: {e}"
-        )))?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(body)
+        .map_err(|e| SourceError::Malformed(format!("tree listing was not a JSON array: {e}")))?;
 
     let mut files = Vec::new();
     for entry in entries {
@@ -182,6 +215,33 @@ impl Source for HuggingFace {
         SourceKind::HuggingFace
     }
 
+    fn endpoints(&self) -> HostEndpoints {
+        let base = self.endpoint.trim_end_matches('/').to_string();
+        HostEndpoints {
+            api_base: format!("{base}/api"),
+            resolve_base: base.clone(),
+            git_base: Some(base),
+            // HuggingFace serves smart-HTTP straight off the repo path.
+            git_suffix: String::new(),
+        }
+    }
+
+    async fn fetch_pointer(&self, rev: &Revision, path: &str) -> Result<Vec<u8>, SourceError> {
+        // `/raw/` serves the pointer text itself for an LFS-backed file, which
+        // is exactly the blob the signed tree names.
+        let url = format!(
+            "{}/{}/raw/{}/{}",
+            self.endpoint.trim_end_matches('/'),
+            rev.repo,
+            rev.commit,
+            urlencode_segments(path),
+        );
+        // Pointers are ~130 bytes. Cap the read so a host that answers `/raw/`
+        // with the real model file (or with garbage) cannot balloon memory
+        // before `looks_like_pointer` gets a chance to reject it.
+        self.get_capped(&url, &rev.repo, MAX_POINTER_BYTES).await
+    }
+
     async fn resolve(&self, spec: &RepoSpec) -> Result<Revision, SourceError> {
         let requested = spec.revision.clone().unwrap_or_else(|| "main".into());
         let url = format!(
@@ -195,6 +255,7 @@ impl Source for HuggingFace {
         Ok(Revision {
             source: SourceKind::HuggingFace,
             repo: spec.repo.clone(),
+            precision: RevisionPrecision::of(&commit),
             commit,
             requested,
         })
@@ -235,6 +296,36 @@ impl Source for HuggingFace {
 }
 
 const MAX_PAGES: usize = 100;
+
+/// Ceiling on a JSON API response. A tree page for a repo with thousands of
+/// shards is a few megabytes; anything past this is not a listing.
+const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on an LFS pointer, which is ~130 bytes in practice.
+const MAX_POINTER_BYTES: usize = 64 * 1024;
+
+/// Percent-encode each segment of a repo-relative file path.
+///
+/// Unlike a revision, a file path's separators are structural but its segments
+/// are arbitrary: a file called `v1#final.gguf` would otherwise truncate the URL
+/// at the fragment and silently fetch something else.
+pub(crate) fn urlencode_segments(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, seg) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        for b in seg.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+    }
+    out
+}
 
 /// Percent-encode a revision for use in a URL path.
 ///

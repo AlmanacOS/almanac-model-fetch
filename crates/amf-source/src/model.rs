@@ -15,6 +15,43 @@ pub struct Revision {
     pub commit: String,
     /// What the operator asked for, kept for the manifest ("main", a tag, …).
     pub requested: String,
+    /// Whether `commit` is a full object id or only a prefix.
+    pub precision: RevisionPrecision,
+}
+
+/// How precisely a revision could be pinned.
+///
+/// Normally `Commit`: HuggingFace resolves over REST, ModelScope over git
+/// `ls-refs`. `Abbreviated` is the degraded path — a host whose git endpoint is
+/// unreachable, leaving only a short id from a REST field. An 8-hex prefix is
+/// about four billion possibilities: adequate against accident, meaningless
+/// against an adversary who can grind commits. The distinction is recorded
+/// rather than smoothed over, because a bundle that claimed an immutable
+/// revision it never established would be lying in the one field an auditor
+/// would most want to trust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionPrecision {
+    /// A full 40-hex object id.
+    Commit,
+    /// A prefix of that many hex characters.
+    Abbreviated { chars: usize },
+}
+
+impl RevisionPrecision {
+    /// Classify an id by its own shape, so no caller can label a prefix as full.
+    pub fn of(commit: &str) -> Self {
+        if commit.len() == 40 {
+            RevisionPrecision::Commit
+        } else {
+            RevisionPrecision::Abbreviated {
+                chars: commit.len(),
+            }
+        }
+    }
+
+    pub fn is_exact(&self) -> bool {
+        matches!(self, RevisionPrecision::Commit)
+    }
 }
 
 /// One file in a remote repository.
@@ -92,7 +129,11 @@ impl Variant {
         let Some(total) = self.files.iter().find_map(|f| f.shard.map(|s| s.total)) else {
             return Vec::new();
         };
-        let present: Vec<u32> = self.files.iter().filter_map(|f| f.shard.map(|s| s.index)).collect();
+        let present: Vec<u32> = self
+            .files
+            .iter()
+            .filter_map(|f| f.shard.map(|s| s.index))
+            .collect();
         (1..=total).filter(|i| !present.contains(i)).collect()
     }
 }
