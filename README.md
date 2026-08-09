@@ -177,6 +177,27 @@ What has actually been run: the musl artifact was built and verified static.
 The container image and the aarch64/Windows targets are **written but not yet
 exercised** — see ARCHITECTURE.md §14 for exactly what was and was not proven.
 
+## RPM packaging
+
+For Fedora and friends, `packaging/rpm/` builds an RPM carrying `amf`, its man
+page, and these documents. Crates are bundled from `Cargo.lock` and the build
+runs `--offline --locked` against them, for the same reason the rest of this
+tool exists: dependencies resolved from the network at build time are not
+pinned inputs.
+
+```bash
+packaging/rpm/make-srpm.sh                     # -> packaging/rpm/out/*.src.rpm
+mock -r fedora-42-x86_64 packaging/rpm/out/*.src.rpm
+```
+
+COPR builds it straight from git through `.copr/Makefile`; see
+[packaging/rpm/README.md](packaging/rpm/README.md) for the project setup and
+for what this spec would still need before Fedora proper would take it.
+
+What has actually been run: the SRPM builds, and rebuilding it locally passes
+`%prep`, `%build`, `%check`, and `%install`. **No COPR build has been
+submitted**, and no mock build has been run.
+
 ## Tests
 
 ```bash

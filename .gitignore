@@ -11,3 +11,9 @@ minisign.key
 
 # Release artifacts produced by `cargo xtask dist`.
 /dist/out
+
+# Source RPMs produced by `packaging/rpm/make-srpm.sh`. The vendored crate tree
+# is only ever written to a temporary directory by that script, but debugging
+# the spec by hand tends to leave one here.
+/packaging/rpm/out
+/vendor

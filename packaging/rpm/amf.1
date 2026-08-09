@@ -1,0 +1,189 @@
+.\" Man page for amf (almanac-model-fetch).
+.\" Kept in the packaging directory rather than generated at build time, so
+.\" that building the RPM needs no extra crates. If the CLI changes, this
+.\" changes with it.
+.TH AMF 1 "2026-08-09" "almanac-model-fetch 0.1.0" "User Commands"
+.SH NAME
+amf \- fetch, verify, and bundle AI models for airgapped import
+.SH SYNOPSIS
+.B amf fetch
+.I REPO_SPEC\fR...
+.BR \-\-usb " " \fIPATH\fR
+.RI [ options ]
+.br
+.B amf verify
+.I PATH
+.RB [ \-\-public\-key
+.IR PATH ]
+.RB [ \-\-upstream\-key
+.IR PATH ]
+.br
+.B amf list
+.I PATH
+.br
+.B amf keygen
+.RB [ \-\-secret
+.IR PATH ]
+.RB [ \-\-public
+.IR PATH ]
+.br
+.B amf trust
+.I SUBCOMMAND
+.SH DESCRIPTION
+.B amf
+runs on a networked machine. It downloads a model you choose, verifies it
+against upstream\-published hashes as it streams, captures what provenance
+exists, signs the result, and writes a self\-contained bundle that a USB drive
+can carry to an airgapped machine with no network at all.
+.PP
+A revision always resolves to an immutable commit SHA before anything is
+fetched, and the bundle records that SHA rather than the branch name. If a host
+cannot name its head commit in full, the bundle records the abbreviated id
+.I as
+abbreviated and says so \(em it never presents a prefix as an immutable
+revision.
+.SH REPO SPECS
+Repository specs are
+.IR org/name [ @revision ][ :variant ].
+Omitting the variant gives an interactive picker; pass
+.B \-\-variant
+for scripts, or
+.B \-\-yes
+to take the default without prompting.
+.SH COMMANDS
+.SS fetch
+Fetch one or more models onto a drive. Each spec is bundled separately.
+.TP
+.BI \-\-usb " PATH"
+Destination drive or directory. Required.
+.TP
+.BI \-\-variant " NAME"
+Quantisation to fetch, when the spec does not name one.
+.TP
+.BI \-\-source " HOST"
+Source host, either
+.B hf
+(default) or
+.BR modelscope .
+ModelScope is for operators who cannot reach HuggingFace; the tool never falls
+back to it automatically, because switching hosts changes what the bundle can
+prove.
+.TP
+.BR \-y ", " \-\-yes
+Accept the default variant without prompting.
+.TP
+.B \-\-force
+Proceed past warnings. Does not override the refusal to write to a FAT
+filesystem.
+.TP
+.B \-\-require\-signature
+Refuse to write a bundle unless the upstream commit signature verified.
+.TP
+.B \-\-no\-corroborate
+Skip cross\-checking the file hash against the other host.
+.TP
+.BI \-\-corroborate\-with " HOST:REPO"
+Corroborate against a specific repository, for mirrors that are not named
+identically upstream.
+.TP
+.B \-\-require\-corroboration
+Refuse to write a bundle unless the other host confirms the hashes.
+.TP
+.BI \-\-key " PATH"
+Secret key used to sign the bundle manifest.
+.TP
+.BI \-\-trust\-store " PATH"
+Trust store location. Must match the store
+.B amf trust
+was pointed at, or pinned keys will not be found.
+.SS verify
+Re\-verify a bundle, or every bundle on a drive. This is the airgapped\-side
+command: it needs no network, no keyserver, and no correct clock.
+.TP
+.BI \-\-public\-key " PATH"
+Public key to check the bundle signature against.
+.TP
+.BI \-\-upstream\-key " PATH"
+Armored PGP public key to check the captured upstream commit signature against,
+obtained out of band.
+.SS list
+Inventory the bundles on a drive or directory.
+.SS keygen
+Generate the fetcher's signing keypair. The public half goes to the airgapped
+machine.
+.TP
+.BI \-\-secret " PATH"
+Where to write the secret key. Default
+.BR amf.key .
+.TP
+.BI \-\-public " PATH"
+Where to write the public key. Default
+.BR amf.pub .
+.TP
+.BI \-\-comment " TEXT"
+Comment identifying this fetcher.
+.TP
+.BI \-\-password " TEXT"
+Password\-protect the secret key.
+.SS trust
+Manage pinned upstream signing keys and observed\-fingerprint history.
+.TP
+.B trust list
+Show pinned keys and every fingerprint ever observed.
+.TP
+.BI "trust add " "HOST KEY_FILE"
+Pin a host's public key, which enables real Tier\-2 verification for it.
+.TP
+.BI "trust remove " HOST
+Remove a host's pinned key.
+.SH CROSS-SOURCE CORROBORATION
+Every fetch asks the other host whether it publishes the same SHA\-256 before
+downloading anything. A miss is silent \(em an operator who chose ModelScope
+because HuggingFace is blocked cannot be expected to reach it. A disagreement
+is loud and is recorded in the manifest, but does not by itself abort: two
+hosts can legitimately differ after a re\-quantisation, unlike a single host
+contradicting its own signed tree, which always aborts.
+.SH FILES
+.TP
+.I ~/.config/almanac\-model\-fetch/trust.json
+Default trust store: pinned upstream keys and observed\-fingerprint history.
+Overridden by
+.B \-\-trust\-store
+or
+.BR $AMF_TRUST_STORE .
+.SH ENVIRONMENT
+.TP
+.B AMF_TRUST_STORE
+Path to the trust store, overriding the default location.
+.SH EXIT STATUS
+.TP
+.B 0
+The command succeeded.
+.TP
+.B 1
+The command failed; the reason is printed to standard error. Verification
+failures are reported this way, not as a partial success.
+.SH EXAMPLES
+Create the signing key once, then fetch a model onto a drive:
+.PP
+.nf
+.RS
+amf keygen \-\-secret amf.key \-\-public amf.pub
+amf fetch unsloth/Llama\-3.2\-1B\-Instruct\-GGUF:Q4_K_M \\
+    \-\-usb /mnt/usb \-\-key amf.key
+.RE
+.fi
+.PP
+On the airgapped machine, with no network:
+.PP
+.nf
+.RS
+amf verify /mnt/usb \-\-public\-key amf.pub
+amf list /mnt/usb
+.RE
+.fi
+.SH SEE ALSO
+The design and trust model are documented in
+.I /usr/share/doc/almanac\-model\-fetch/ARCHITECTURE.md
+.SH AUTHOR
+https://github.com/clemperorpenguin/almanac\-model\-fetch
