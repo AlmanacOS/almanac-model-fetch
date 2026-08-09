@@ -53,6 +53,14 @@ copr-cli build-package almanac-model-fetch --name almanac-model-fetch
 chroot **with** network access, which is where the crates are fetched. The
 build of the binary package that follows has no network, and does not need one.
 
+Leave the package's **Subdirectory** field empty. It is tempting to point it at
+`packaging/rpm` because that is where the spec lives, but this build method
+only needs `.copr/Makefile`, and the field changes the working directory make
+is invoked from. The makefile locates the checkout from its own path precisely
+so that either setting works — a subdirectory used to produce a bare
+`packaging/rpm/make-srpm.sh: No such file or directory` — but empty is what
+this is meant to be.
+
 Adding aarch64 chroots costs nothing but build time — the package is
 `ExclusiveArch: %{rust_arches}` and has no architecture-specific code beyond
 what rustc handles.
